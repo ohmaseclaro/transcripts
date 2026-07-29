@@ -12,15 +12,14 @@ description: >
 
 # Find and read transcripts
 
-This machine has a unified transcript browser: the `transcripts` CLI (repo:
-`~/ohmaseclaro/transcripts/`, on PATH via `~/.local/bin/transcripts`). It indexes every local
+This machine has a unified transcript browser: the `transcripts` CLI (usually on PATH at
+`~/.local/bin/transcripts`; https://github.com/ohmaseclaro/transcripts). It indexes every local
 agent conversation — Claude Code, Claude Cowork, Cursor app composers, cursor-agent CLI — with
 real chat-window titles, timestamps, and the head *and* tail of each session's last message.
 Use it instead of hand-globbing `~/.claude/projects` or poking at Cursor's sqlite stores: it
 already knows every store location, dedupes synced copies, and resolves proper titles.
 
-Full documentation: `~/ohmaseclaro/transcripts/README.md` — read it if you need details beyond
-this page (all flags, column semantics, cache, troubleshooting).
+Run `transcripts --help` for the full flag list (column semantics, cache, troubleshooting).
 
 ## Workflow
 
@@ -31,7 +30,8 @@ Always use machine-readable output when you are the consumer:
 ```sh
 transcripts --json --since 7d                      # everything recent, one JSON per line
 transcripts --json --since 2d -a claude            # only claude (also: cursor, all)
-transcripts --json --full-list -q "oauth bug"      # keyword search over title + last message + project
+transcripts --json -q "oauth bug"                  # title + last message + project + id, all time
+transcripts --json -q oauth --content              # ALSO search inside the conversations
 ```
 
 Each line has: `id, source, updated, updated_ts, title, project, last_role,
@@ -39,10 +39,21 @@ last_message_head, last_message_tail, path, ref`.
 
 Picking the right session: `title` is the real chat-window name; `last_message_head`/`_tail`
 show how the conversation started ending and how it actually ended — the tail is usually the
-strongest signal of where a session left off. Filter with `-q` (matches title, both message
-columns, project, and id). Default window is 24h — widen with `--since 7d`/`--since 30d` or
-`--full-list` when the user refers to something older. Add `--subagents` if they mean a
-background/subagent run.
+strongest signal of where a session left off.
+
+**Two search depths, and the difference matters:**
+
+- `-q words` searches cached metadata only — title, project, id, and the first/last 300 chars of
+  the session's newest message. Instant. Every word must match (case-insensitive substring), so
+  prefer two or three distinctive words over a sentence.
+- `-q words --content` additionally opens each non-matching transcript and searches the messages
+  themselves. This is what you want for "the chat where we decided X" when X was said mid-session
+  — metadata search structurally cannot find that. It is slow and stops after `--scan`
+  transcripts (default 300, newest first), printing what it skipped on stderr. **Narrow before
+  you deepen**: `-a claude -s 7d --content` beats `--content --scan 2000`.
+
+A query searches all time by default. Without a query the window is 24h, so pass `--since`
+when listing. Add `--subagents` if the user means a background/subagent run.
 
 ### 2. Read the transcript
 
@@ -68,8 +79,8 @@ said. Include the session's `path` so the user can point other tools at it.
 
 ## Examples
 
-**"continue where my last lathex session left off"**
-→ `transcripts --json --since 3d -q lathex` → pick newest by `updated_ts` → `--details 'REF'`
+**"continue where my last billing session left off"**
+→ `transcripts --json --since 3d -q billing` → pick newest by `updated_ts` → `--details 'REF'`
 → summarize state + open threads, then continue the work.
 
 **"what did the overnight agent runs do?"**
@@ -77,9 +88,9 @@ said. Include the session's `path` so the user can point other tools at it.
 each relevant ref → report per-session outcomes.
 
 **"find that conversation where we decided the firecrawl key strategy"**
-→ `transcripts --json --full-list -q firecrawl` → if too many/few hits, vary keywords
-(`-q "api key"`) or widen/narrow `--since` → `--export 'REF'` and search the markdown for the
-decision.
+→ `transcripts --json -q firecrawl` → nothing? the decision was mid-conversation, so metadata
+search can't see it: `transcripts --json -q firecrawl --content -s 30d` → `--export 'REF'` and
+search the markdown for the decision.
 
 ## Notes
 

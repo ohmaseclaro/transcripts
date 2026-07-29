@@ -1,23 +1,41 @@
 # transcripts
 
-Unified TUI browser for every AI-agent chat transcript on this machine — Claude Code, Claude Cowork, Cursor app, and cursor-agent CLI — in one searchable list, with a non-interactive mode for scripting.
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![requires: python3](https://img.shields.io/badge/requires-python3-informational)
+![platform: macOS · Linux](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux-lightgrey)
 
-A single self-contained bash script (`transcripts`) with an embedded Python core. No dependencies beyond `python3`; `fzf` is optional but unlocks the nicer TUI.
-
-## Layout & install
+Every AI-agent chat you have had on this machine — Claude Code, Claude Cowork, Cursor app, cursor-agent CLI — in one searchable list. Interactive TUI for humans, `--json` for scripts and agents.
 
 ```
-~/ohmaseclaro/transcripts/transcripts   # canonical copy (this repo)
-~/.local/bin/transcripts                # symlink → repo copy
+ 3h  claude·code  545caa2f  Filter behavior review        transcripts      you: the filter doesn't work…
+ 1d  cursor·app   9b2e1170  Retry wrapper for the API     billing       cursor: added the backoff…
+ 2d  claude·cwrk  0af31c92  Nightly report job            reporting        you: ship it
 ```
 
-The symlink means edits to the repo copy are live immediately. To (re)create it:
+One self-contained bash script with an embedded Python core. No dependencies beyond `python3`. `fzf` is optional and unlocks the full TUI.
+
+## Install
 
 ```sh
-~/ohmaseclaro/transcripts/transcripts --install
+curl -fsSL https://raw.githubusercontent.com/ohmaseclaro/transcripts/main/install.sh | sh
 ```
 
-`--install` symlinks into `~/.local/bin` and adds that dir to PATH in your shell rc if missing.
+That installs `transcripts` into `~/.local/bin` and, if Claude Code or Cursor is present, the [`find-and-read-transcripts`](skill/find-and-read-transcripts/SKILL.md) agent skill — so your agent can search your own past sessions when you say *"what did we decide about X last week?"*.
+
+Prefer to read before you pipe? [`install.sh`](install.sh) is 60 lines. Or do it by hand:
+
+```sh
+git clone https://github.com/ohmaseclaro/transcripts.git
+./transcripts/transcripts --install     # symlinks into ~/.local/bin, adds it to PATH
+```
+
+Installer knobs: `TRANSCRIPTS_BIN` (install dir), `TRANSCRIPTS_REF` (branch/tag), `TRANSCRIPTS_NO_SKILL=1` (CLI only).
+
+## Privacy
+
+This tool is entirely local. It reads the transcript stores your agents already wrote to your disk, caches parsed metadata under `~/.cache/transcripts-tui/`, and writes markdown only when you ask for `--export`. Nothing is uploaded, and there is no network code in it at all — `install.sh` is the only file that touches the network.
+
+Your transcripts contain whatever you pasted into those chats. Treat `--export` output, and anything you share from it, accordingly.
 
 ## What it scans
 
@@ -43,16 +61,40 @@ With fzf installed:
 
 | Key      | Action |
 |----------|--------|
-| type     | fuzzy-filter (title, last message head+tail, project, id) |
+| type     | filter — every word must match, over title, project, id and the last message |
 | `enter`  | pick — prints the transcript path and copies it to the clipboard |
 | `tab`    | show/hide the transcript preview pane |
+| `ctrl-f` | search *inside* the transcripts for what you typed (see [Searching](#searching)) |
 | `ctrl-a` | cycle agent: all → claude → cursor |
 | `ctrl-e` | export the highlighted transcript to `~/Downloads/*.md` |
 | `ctrl-y` | copy path without leaving the list |
-| `ctrl-r` | refresh the index |
+| `ctrl-r` | refresh the index, back to the fast filter |
 | `esc`    | quit |
 
-Without fzf you get a numbered-list fallback: type a number to open, `/words` to filter, `a` switch agent, `n`/`p` page, `s` toggle subagents, `q` quit.
+Without fzf you get a numbered-list fallback: type a number to open, `/words` to filter, `a` switch agent, `n`/`p` page, `s` toggle subagents, `c` toggle searching inside transcripts, `q` quit.
+
+## Searching
+
+A query is split on whitespace and **every word must match** (case-insensitive substring, any order). The TUI, the table, the TSV and the JSON all agree on what a query means.
+
+By default only cached metadata is searched — title, project, session id, and the first and last 300 characters of the session's newest message. That is instant, and it is enough when you remember roughly what a session was called or how it ended. It cannot see the middle of a conversation.
+
+```sh
+transcripts -q "oauth bug"                 # metadata only — instant
+transcripts -q oauth --content --list      # also read the conversations — slow
+transcripts -q oauth -c -s 7d --scan 800   # narrow the window, scan deeper
+```
+
+`--content`/`-c` opens each non-matching transcript and searches the messages themselves. Since a busy machine can hold tens of gigabytes of transcripts, it stops after `--scan` transcripts (default 300, newest first) and tells you on stderr exactly how many it skipped:
+
+```
+transcripts: --content read the 300 newest transcripts; 3030 older ones were NOT searched.
+Narrow with --since/--agent, or raise --scan (default 300).
+```
+
+Narrowing first (`-a claude`, `-s 7d`) is almost always faster than raising `--scan`.
+
+**A query implies `--since all`.** Without a query, `--list` shows the last 24h; with one, it searches all time unless you pass `--since` yourself.
 
 ## Non-interactive mode
 
@@ -63,7 +105,8 @@ transcripts --full-list                # everything, no time window
 transcripts --table                    # force the pretty table (even piped)
 transcripts --tsv                      # force raw TSV (even on a terminal)
 transcripts --json                     # one JSON object per line
-transcripts --list -a cursor -q kubota # combine with --agent / --query / --subagents
+transcripts --list -a cursor -q "retry wrapper" # combine with --agent / --query / --subagents
+transcripts --json -q "retry wrapper" --content # search inside the transcripts too
 ```
 
 `--since`/`--full-list` imply `--list`. Value flags accept both `--flag value` and `--flag=value`.
@@ -109,13 +152,33 @@ Parsed results are cached in `~/.cache/transcripts-tui/index-v5.json`, keyed by 
 
 | Var | Effect |
 |-----|--------|
-| `TRANSCRIPTS_HOME`    | scan this dir as "home" instead of `~` (useful for testing with fixtures) |
+| `TRANSCRIPTS_HOME`    | scan **only** this dir as "home" instead of `~` and every other readable account home (used by the tests) |
 | `TRANSCRIPTS_NO_FZF`  | set to force the no-fzf fallback TUI |
+| `TRANSCRIPTS_SCAN`    | default `--content` scan cap (default 300) |
 | `COLUMNS`             | table width when the terminal size can't be detected |
 
 ## Troubleshooting
 
 - **A session shows its first message as title** — its jsonl has no `ai-title`/`custom-title`/summary line (common for scheduled/headless runs).
-- **Nothing listed** — default window is 24h; try `--since 7d` or `--full-list`. Run `--doctor` to confirm the store paths exist.
+- **Nothing listed** — without a query the default window is 24h; try `--since 7d` or `--full-list`. Run `--doctor` to confirm the store paths exist.
+- **A query finds nothing you know you discussed** — metadata search only sees titles and the newest message. Add `--content` to search the conversations themselves.
+- **`--content` is slow** — it is reading transcripts off disk. Narrow with `-a claude` or `-s 7d` before raising `--scan`.
 - **Stale rows after heavy use** — `rm -rf ~/.cache/transcripts-tui`.
 - **Locked/huge Cursor db skipped** — if the global `state.vscdb` can't be opened read-only it is skipped rather than copied (guard at 2 GB); close Cursor and retry.
+
+## Development
+
+The whole tool is one file: [`transcripts`](transcripts). Bash handles arguments and the TUI; an embedded Python heredoc does the parsing, indexing and output.
+
+```sh
+./test-filter.sh     # filter behaviour, against a throwaway fixture home
+bash -n transcripts  # syntax check
+```
+
+`test-filter.sh` builds a fake `~/.claude/projects` in a temp dir and points the tool at it via `TRANSCRIPTS_HOME`, so it never touches your real transcripts.
+
+Bug reports and PRs welcome — [open an issue](https://github.com/ohmaseclaro/transcripts/issues). If you are adding a store (another agent, another editor), the scanners live next to `claude_files()` and each one just needs to produce `mkrow(...)` results.
+
+## License
+
+[MIT](LICENSE)
