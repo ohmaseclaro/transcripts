@@ -26,6 +26,10 @@ msg "$R" user "the refresh token rotation is dropping sessions" "2026-07-27T10:0
 for i in $(seq 1 40); do
   msg "$R" user "unrelated filler message number $i padding this out past three hundred characters so the cached head and tail cannot possibly contain the needle we are looking for in this test case here" "2026-07-27T11:00:00Z"
 done
+# one very long message with the needle ~900 chars in: the detail view must window to it,
+# not show the first 700 chars and cut the match off
+LONG="$(python3 -c 'print("MSGSTART " + "preamble text that goes on and on " * 28 + " the PINEAPPLE decision was made here " + "trailing chatter " * 40)')"
+msg "$R" user "$LONG" "2026-07-27T11:30:00Z"
 msg "$R" user "thanks, ship it" "2026-07-27T12:00:00Z"
 touch -t 202607271200 "$R"
 
@@ -98,6 +102,49 @@ if command -v fzf >/dev/null 2>&1; then
 else
   echo "  skip fzf matching check (fzf not installed)"
 fi
+
+# 7. detail view: highlight the terms, and lead with the matches instead of the newest message
+REF="cc|$R|aaaaaaaa-1111-2222-3333-444444444444"
+HL_ON=$'\033[30;43m'
+has() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+
+D_PLAIN="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __details "$REF" 2>/dev/null)"
+D_HL="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __details "$REF" "rotation" 2>/dev/null)"
+
+if has "$HL_ON" "$D_HL"; then PASS=$((PASS + 1)); echo "  ok   details highlights the query"
+else FAIL=$((FAIL + 1)); echo "  FAIL details did not highlight the query"; fi
+
+if has "$HL_ON" "$D_PLAIN"; then FAIL=$((FAIL + 1)); echo "  FAIL details highlights with no query"
+else PASS=$((PASS + 1)); echo "  ok   details stays plain with no query"; fi
+
+if has "mentioning" "$D_HL" && has "rest of the conversation" "$D_HL"; then
+  PASS=$((PASS + 1)); echo "  ok   details leads with a matches section"
+else FAIL=$((FAIL + 1)); echo "  FAIL details has no matches section"; fi
+
+# the matching message must appear before the newest message, not after it
+POS_MATCH="$(printf '%s' "$D_HL" | grep -n "dropping sessions" | head -1 | cut -d: -f1)"
+POS_NEWEST="$(printf '%s' "$D_HL" | grep -n "thanks, ship it" | head -1 | cut -d: -f1)"
+if [ -n "$POS_MATCH" ] && [ -n "$POS_NEWEST" ] && [ "$POS_MATCH" -lt "$POS_NEWEST" ]; then
+  PASS=$((PASS + 1)); echo "  ok   match is shown above the newest message"
+else FAIL=$((FAIL + 1)); echo "  FAIL match not surfaced above the newest message ($POS_MATCH vs $POS_NEWEST)"; fi
+
+# 8. a match ~900 chars into a message must be windowed into view, not truncated away at 700
+D_DEEP="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __details "$REF" "pineapple" 2>/dev/null)"
+if has "PINEAPPLE" "$D_DEEP"; then PASS=$((PASS + 1)); echo "  ok   deep match is windowed into view"
+else FAIL=$((FAIL + 1)); echo "  FAIL deep match cut off by the 700-char head"; fi
+if has "MSGSTART" "$D_DEEP"; then
+  FAIL=$((FAIL + 1)); echo "  FAIL deep match still rendered from the top of the message"
+else PASS=$((PASS + 1)); echo "  ok   deep match window starts near the match, not the top"; fi
+
+# 9. the sticky query survives ctrl-f clearing fzf's own query
+ST="$HOME_DIR/state"; printf 'all\n' > "$ST"
+TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __reload "$ST" 0 "pineapple" content >/dev/null 2>&1
+ok "ctrl-f stores the sticky query" "pineapple" "$(sed -n 2p "$ST")"
+D_STICKY="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __details "$REF" "" "$ST" 2>/dev/null)"
+if has "$HL_ON" "$D_STICKY"; then PASS=$((PASS + 1)); echo "  ok   preview highlights from the sticky query"
+else FAIL=$((FAIL + 1)); echo "  FAIL sticky query not used by the preview"; fi
+TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __reload "$ST" 0 "" >/dev/null 2>&1
+ok "ctrl-r clears the sticky query" "" "$(sed -n 2p "$ST")"
 
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

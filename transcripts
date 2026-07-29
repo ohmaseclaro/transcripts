@@ -40,12 +40,16 @@
 #   otherwise. Typing in the TUI uses the same rule (fzf --exact over the same text), so the
 #   list, the table and the TUI all agree on what a query means.
 #
+#   With a query, the transcript view highlights every hit and opens on the matching messages
+#   rather than the newest one — including matches deep inside a long message, which it windows
+#   into view. Same for `--details REF` when -q comes first.
+#
 # Keys (fzf mode): type=filter · enter=pick (copies path) · tab=show/hide transcript pane
 #                  ctrl-f=search inside transcripts (--content on what you typed)
 #                  ctrl-a=switch agent · ctrl-e=export markdown · ctrl-y=copy path · ctrl-r=refresh
 set -u
 
-VERSION="1.9.0"
+VERSION="1.10.0"
 SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || echo "$0")"
 
 command -v python3 >/dev/null 2>&1 || { echo "transcripts: python3 required (macOS: xcode-select --install)"; exit 1; }
@@ -141,6 +145,25 @@ def row_hay(r):
     """Everything the cache knows about a row — the metadata haystack."""
     return " ".join((r["n"], r["l"], r.get("z") or "", r["j"], r["i"],
                      f'{r["a"]}·{r["s"]}', r["r"] or ""))
+
+HL = "\x1b[30;43m"      # black on yellow — legible on light and dark terminals alike
+
+def hl_re(terms):
+    return re.compile("|".join(re.escape(t) for t in terms), re.I) if terms else None
+
+def hl(t, rx):
+    return rx.sub(lambda m: f"{HL}{m.group(0)}{R}", t) if rx else t
+
+def snip(t, terms, n=700):
+    """Window of t around its FIRST matching term. A match 4k chars into a message is
+    invisible if the view always starts at the top of the message."""
+    low = t.lower()
+    hits = [i for i in (low.find(x) for x in terms) if i >= 0]
+    at = min(hits) if hits else -1
+    if at < 0 or at < n - 80:                       # already visible from the top
+        return t[:n] + (" …" if len(t) > n else "")
+    s = max(0, at - 120)
+    return "… " + t[s:s + n] + (" …" if s + n < len(t) else "")
 
 def body_text(r):
     """Full conversation text for a row. Only called under --content: this opens the
@@ -1090,9 +1113,12 @@ def cc_own_title(path):
         elif t == "summary" and d.get("summary") and not summ: summ = d["summary"]
     return cu or ai or summ
 
-def do_details(ref):
+def do_details(ref, query=""):
+    terms = qterms(query)
+    # With a query, look deeper than the last 14 messages — a --content hit is usually
+    # mid-conversation, and a preview that can't show why it matched is useless.
     try:
-        typ, path, rid, msgs, title = get_messages(ref, 14)
+        typ, path, rid, msgs, title = get_messages(ref, 400 if terms else 14)
     except Exception as e:
         print(f"could not parse ref: {e}"); return
     if typ == "cc" and not title: title = cc_own_title(path)
@@ -1100,22 +1126,47 @@ def do_details(ref):
              "cl": "Cursor app chat (legacy)", "cj": "Cursor subagent run"}
     try: mt = fmt_ts(os.path.getmtime(path))
     except OSError: mt = "?"
-    print(f"{BOLD}{GR}● {title or names.get(typ, typ)}{R}")
+    rx = hl_re(terms)
+    print(f"{BOLD}{GR}● {hl(title or names.get(typ, typ), rx)}{R}")
     sub = (f"{names.get(typ, typ)} · " if title else "") + f"updated {mt}"
     print(f"{DIM}   {sub}{R}")
     print(f"{DIM}   id     {R}{rid}")
     print(f"{DIM}   file   {R}{path}")
-    print(f"{DIM}{'─' * 34} latest message first ▼{R}")
+
+    msgs = list(reversed(msgs))                     # newest first
+    hits = [i for i, m in enumerate(msgs) if terms and any(t in m[1].lower() for t in terms)]
+
+    def show(items):
+        for i in items:
+            role, t, ts = msgs[i]
+            col = CY if role == "user" else MG
+            who = "you" if role == "user" else role
+            t = re.sub(r"\n{3,}", "\n\n", t.strip())
+            t = snip(t, terms) if i in hits else (t[:700] + " …" if len(t) > 700 else t)
+            print(f"{col}{BOLD}▌ {who}{R}{DIM}{(' · ' + ts) if ts else ''}{R}")
+            print(hl(t, rx))
+            print()
+
     if not msgs:
+        print(f"{DIM}{'─' * 34} latest message first ▼{R}")
         print(f"{DIM}(no displayable messages){R}")
-    for role, t, ts in reversed(msgs):
-        col = CY if role == "user" else MG
-        who = "you" if role == "user" else role
-        t = re.sub(r"\n{3,}", "\n\n", t.strip())
-        if len(t) > 700: t = t[:700] + " …"
-        print(f"{col}{BOLD}▌ {who}{R}{DIM}{(' · ' + ts) if ts else ''}{R}")
-        print(t)
-        print()
+        return
+
+    lead = []
+    if terms:
+        if hits:
+            lead = hits[:6]
+            more = f" (+{len(hits) - len(lead)} more)" if len(hits) > len(lead) else ""
+            print(f"{DIM}{'─' * 22} {len(hits)} message(s) mentioning "
+                  f"{HL}{query}{R}{DIM} (any word){more}, newest first ▼{R}")
+            show(lead)
+            print(f"{DIM}{'─' * 30} rest of the conversation ▼{R}")
+        else:
+            print(f"{DIM}{'─' * 12} no message matches {HL}{query}{R}{DIM} — "
+                  f"it matched the title, project or id ▼{R}")
+    else:
+        print(f"{DIM}{'─' * 34} latest message first ▼{R}")
+    show([i for i in range(min(14, len(msgs))) if i not in lead])
 
 def do_export(ref):
     typ, path, rid, msgs, title = get_messages(ref, 400)
@@ -1275,7 +1326,7 @@ elif CMD == "table":
 elif CMD == "legend":
     print(f'{DIM}{"AGE":>4} {"SOURCE":<11} {"ID":<8} {"TITLE":<44} {"PROJECT":<16} {"FROM":>6}  LAST MESSAGE HEAD ⋯ TAIL{R}')
 elif CMD == "details":
-    do_details(ARG1)
+    do_details(ARG1, ARG2)
 elif CMD == "export":
     do_export(ARG1)
 elif CMD == "doctor":
@@ -1295,7 +1346,12 @@ copy_ref_path() {
   printf '%s' "$p" | _clip 2>/dev/null
 }
 
-state_agent() { cat "$1" 2>/dev/null || echo all; }
+# STATE file: line 1 = agent, line 2 = sticky query (what ctrl-f last searched for). The
+# sticky query exists because ctrl-f clears fzf's own query — without it the preview would
+# have nothing to highlight on exactly the search that needed highlighting most.
+state_agent() { local a; a="$(sed -n 1p "$1" 2>/dev/null)"; printf '%s' "${a:-all}"; }
+state_query() { sed -n 2p "$1" 2>/dev/null; }
+write_state() { printf '%s\n%s\n' "$2" "$3" > "$1"; }   # write_state STATE AGENT QUERY
 
 cycle_state() { # STATE -> writes next agent, prints nothing
   local cur next
@@ -1305,7 +1361,7 @@ cycle_state() { # STATE -> writes next agent, prints nothing
     claude) next=cursor ;;
     *) next=all ;;
   esac
-  printf '%s' "$next" > "$1"
+  write_state "$1" "$next" "$(state_query "$1")"
 }
 
 do_install() {
@@ -1353,17 +1409,23 @@ while [ $# -gt 0 ]; do
     --subagents) SUB=1 ;;
     --install) do_install; exit $? ;;
     --doctor) run_py doctor; exit $? ;;
-    --details) shift; run_py details "${1:-}"; exit $? ;;
+    --details) shift; run_py details "${1:-}" "$QUERY"; exit $? ;;
     --export) shift; run_py export "${1:-}"; exit $? ;;
     --version) echo "transcripts $VERSION"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     __index) run_py index "${2:-all}" "${3:-}" "${4:-0}"; exit $? ;;
-    __details) run_py details "${2:-}"; exit $? ;;
+    __details) # __details REF [QUERY] [STATE] — fall back to the sticky query from ctrl-f
+      dq="${3:-}"
+      [ -z "$dq" ] && [ -n "${4:-}" ] && dq="$(state_query "$4")"
+      run_py details "${2:-}" "$dq"; exit $? ;;
     __export) run_py export "${2:-}"; exit $? ;;
     __copy) copy_ref_path "${2:-}"; exit 0 ;;
     __reload) # __reload STATE SUB QUERY [next|content]
       st="${2:-}"; sb="${3:-0}"; q="${4:-}"; md="${5:-}"
       [ "$md" = "next" ] && cycle_state "$st"
+      # ctrl-f makes the query sticky (for preview highlighting); ctrl-r/ctrl-a clear it
+      if [ "$md" = "content" ]; then write_state "$st" "$(state_agent "$st")" "$q"
+      else write_state "$st" "$(state_agent "$st")" ""; fi
       run_py index "$(state_agent "$st")" "$q" "$sb" \
         "$([ "$md" = "content" ] && echo 1 || echo 0)"; exit $? ;;
     *) echo "transcripts: unknown option $1 (see --help)"; exit 1 ;;
@@ -1409,7 +1471,7 @@ if [ -z "$AGENT" ]; then
 fi
 
 STATE="$(mktemp "${TMPDIR:-/tmp}/transcripts.XXXXXX")"
-printf '%s' "$AGENT" > "$STATE"
+write_state "$STATE" "$AGENT" "$QUERY"
 trap 'rm -f "$STATE"' EXIT
 
 # ---------------------------------------------------------------- fzf TUI
@@ -1424,7 +1486,7 @@ if command -v fzf >/dev/null 2>&1 && [ -z "${TRANSCRIPTS_NO_FZF:-}" ]; then
     --exact --info=inline \
     --prompt="  $AGENT ${QUERY:+[$QUERY] }› type to filter: " \
     --header="$HDR" \
-    --preview="$SELQ __details {1}" \
+    --preview="$SELQ __details {1} {q} '$STATE'" \
     --preview-window='down:60%:wrap' \
     --bind='tab:toggle-preview' \
     --bind="ctrl-f:reload($SELQ __reload '$STATE' $SUB {q} content)+change-prompt(  $AGENT › matched inside transcripts, refine: )+clear-query" \
@@ -1497,7 +1559,7 @@ while :; do
     *)
       ref="$(printf '%s\n' "$LIST" | sed -n "${ans}p" | cut -f1)"
       [ -z "$ref" ] && continue
-      run_py details "$ref" | ${PAGER:-less -R}
+      run_py details "$ref" "$QUERY" | ${PAGER:-less -R}
       p="$(ref_path "$ref")"
       printf 'c=copy+print path   e=export .md   enter=back to list › '
       read -r act

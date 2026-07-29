@@ -69,7 +69,7 @@ With fzf installed:
 |----------|--------|
 | type     | filter — every word must match, over title, project, id and the last message |
 | `enter`  | pick — prints the transcript path and copies it to the clipboard |
-| `tab`    | show/hide the transcript preview pane |
+| `tab`    | show/hide the transcript preview pane — matches are highlighted and shown first |
 | `ctrl-f` | search *inside* the transcripts for what you typed (see [Searching](#searching)) |
 | `ctrl-a` | cycle agent: all → claude → cursor |
 | `ctrl-e` | export the highlighted transcript to `~/Downloads/*.md` |
@@ -101,6 +101,18 @@ Narrow with --since/--agent, or raise --scan (default 300).
 Narrowing first (`-a claude`, `-s 7d`) is almost always faster than raising `--scan`.
 
 **A query implies `--since all`.** Without a query, `--list` shows the last 24h; with one, it searches all time unless you pass `--since` yourself.
+
+### Seeing why something matched
+
+With a query active, the transcript view doesn't start at the newest message — it opens on the messages that actually matched, highlights every hit, and only then shows the rest of the conversation:
+
+```
+────────────────────── 3 message(s) mentioning oauth (any word), newest first ▼
+▌ you · 2026-07-27T10:02:00Z
+… the refresh token rotation is dropping sessions on every oauth retry …
+```
+
+A hit buried 4,000 characters into a long message gets windowed into view rather than truncated away at the top of it. This works in the fzf preview pane (including after `ctrl-f`, which keeps the query for highlighting even though the list filter is cleared), in the no-fzf fallback, and in `transcripts -q oauth --details 'REF'`.
 
 ## Non-interactive mode
 

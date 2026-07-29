@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.10.0
+
+**See why a session matched, without scrolling for it.**
+
+- Query terms are **highlighted** everywhere the transcript is rendered: the fzf preview pane,
+  the no-fzf detail view, and `transcripts -q term --details 'REF'`.
+- The view **opens on the matches, not the newest message.** With a query, matching messages are
+  listed first (newest first), then the rest of the conversation. It also looks past the last 14
+  messages, so a `--content` hit from the middle of a long session is actually visible.
+- A hit buried deep inside a single long message is **windowed into view** instead of being
+  truncated away by the 700-character message cap.
+- `ctrl-f` clears fzf's query so content-only matches can show — the query is now kept in the
+  session state file so the preview still knows what to highlight. `ctrl-r`/`ctrl-a` clear it.
+
 ## 1.9.0
 
 **One filter everywhere, plus optional search inside transcripts.**
