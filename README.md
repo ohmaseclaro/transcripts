@@ -22,6 +22,12 @@ curl -fsSL https://raw.githubusercontent.com/ohmaseclaro/transcripts/main/instal
 
 That installs `transcripts` into `~/.local/bin` and, if Claude Code or Cursor is present, the [`find-and-read-transcripts`](skill/find-and-read-transcripts/SKILL.md) agent skill — so your agent can search your own past sessions when you say *"what did we decide about X last week?"*.
 
+Same installer, [as a gist](https://gist.github.com/ohmaseclaro/6a83daf8f8b59c5bf684db2c94db641a) if you'd rather link that:
+
+```sh
+curl -fsSL https://gist.githubusercontent.com/ohmaseclaro/6a83daf8f8b59c5bf684db2c94db641a/raw/install.sh | sh
+```
+
 Prefer to read before you pipe? [`install.sh`](install.sh) is 60 lines. Or do it by hand:
 
 ```sh
