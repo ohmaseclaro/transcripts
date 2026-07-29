@@ -27,11 +27,25 @@
 #   transcripts --doctor               # show what was found where (debugging)
 #   transcripts --install              # symlink into ~/.local/bin + add to PATH
 #
+# Searching:
+#   A query is split on whitespace and EVERY word must match (case-insensitive substring).
+#   By default only cached metadata is searched — title, project, session id, and the first
+#   and last 300 chars of the newest message. That is instant but shallow.
+#     transcripts -q "oauth bug" --list          # metadata only (fast)
+#     transcripts -q oauth --content --list      # also read the conversations (slow)
+#     transcripts -q oauth -c -s 7d --scan 800   # narrow the window, scan deeper
+#   --content/-c opens each non-matching transcript and searches the messages themselves.
+#   It stops after --scan transcripts (default 300, newest first) and says so on stderr.
+#   Giving a query drops the implicit 24h window: -q searches all time unless --since says
+#   otherwise. Typing in the TUI uses the same rule (fzf --exact over the same text), so the
+#   list, the table and the TUI all agree on what a query means.
+#
 # Keys (fzf mode): type=filter · enter=pick (copies path) · tab=show/hide transcript pane
+#                  ctrl-f=search inside transcripts (--content on what you typed)
 #                  ctrl-a=switch agent · ctrl-e=export markdown · ctrl-y=copy path · ctrl-r=refresh
 set -u
 
-VERSION="1.8.0"
+VERSION="1.9.0"
 SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || echo "$0")"
 
 command -v python3 >/dev/null 2>&1 || { echo "transcripts: python3 required (macOS: xcode-select --install)"; exit 1; }
@@ -46,8 +60,9 @@ _clip() {
 }
 
 # ---------------------------------------------------------------- python core
-run_py() { # run_py CMD ARG1 ARG2 ARG3 ARG4
-  TR_CMD="${1:-}" TR_ARG1="${2:-}" TR_ARG2="${3:-}" TR_ARG3="${4:-}" TR_ARG4="${5:-}" python3 - <<'PYCODE'
+run_py() { # run_py CMD ARG1 ARG2 ARG3 ARG4 ARG5
+  TR_CMD="${1:-}" TR_ARG1="${2:-}" TR_ARG2="${3:-}" TR_ARG3="${4:-}" TR_ARG4="${5:-}" \
+  TR_ARG5="${6:-}" python3 - <<'PYCODE'
 import os, sys, re, json, glob, time, sqlite3, tempfile, shutil, signal
 
 try: signal.signal(signal.SIGPIPE, signal.SIG_DFL)
@@ -58,6 +73,7 @@ ARG1 = os.environ.get("TR_ARG1", "")
 ARG2 = os.environ.get("TR_ARG2", "")
 ARG3 = os.environ.get("TR_ARG3", "")
 ARG4 = os.environ.get("TR_ARG4", "")
+ARG5 = os.environ.get("TR_ARG5", "")
 
 def since_seconds(spec):
     """'10d'/'5h'/'30m' -> seconds; ''/'all' -> None; invalid -> exit 1."""
@@ -75,6 +91,9 @@ CACHE_FILE = os.path.join(CACHE_DIR, "index-v5.json")
 for _old in ("index-v1.json", "index-v2.json", "index-v3.json", "index-v4.json"):
     try: os.remove(os.path.join(CACHE_DIR, _old))
     except OSError: pass
+
+try: SCAN_CAP = max(1, int(os.environ.get("TRANSCRIPTS_SCAN") or 300))
+except ValueError: SCAN_CAP = 300
 
 R  = "\x1b[0m";  DIM = "\x1b[2m";  BOLD = "\x1b[1m"
 CY = "\x1b[36m"; MG = "\x1b[35m"; GR = "\x1b[32m"; YL = "\x1b[33m"; BL = "\x1b[34m"
@@ -107,6 +126,30 @@ def tail_disp(l, z, shown, n):
 
 def esc(s):
     return re.sub(r"[\t\r\n\x1f]", " ", s or "")
+
+# ------------------------------------------------------------- query matching
+# One matcher for every mode: whitespace splits the query into terms, ALL must appear
+# (case-insensitive substring). ponytail: no quoting/regex — add when someone needs a phrase.
+def qterms(query):
+    return [t for t in (query or "").lower().split() if t]
+
+def qmatch(terms, hay):
+    h = hay.lower()
+    return all(t in h for t in terms)
+
+def row_hay(r):
+    """Everything the cache knows about a row — the metadata haystack."""
+    return " ".join((r["n"], r["l"], r.get("z") or "", r["j"], r["i"],
+                     f'{r["a"]}·{r["s"]}', r["r"] or ""))
+
+def body_text(r):
+    """Full conversation text for a row. Only called under --content: this opens the
+    transcript (jsonl read / sqlite query), so it is orders of magnitude slower than row_hay."""
+    try:
+        _typ, _path, _rid, msgs, title = get_messages(r["f"], 2000)
+    except Exception:
+        return ""
+    return (title or "") + " " + " ".join(m[1] for m in msgs)
 
 def jload(b):
     try: return json.loads(b)
@@ -229,7 +272,10 @@ def head_tail(f, n_head=250, tail_bytes=262144):
     return head, tail
 
 def _user_homes():
-    """This user's home + any other readable account homes (multi-account machines)."""
+    """This user's home + any other readable account homes (multi-account machines).
+    An explicit TRANSCRIPTS_HOME means "look only here" — used by tests and by anyone
+    pointing the tool at a copied/mounted home."""
+    if os.environ.get("TRANSCRIPTS_HOME"): return [HOME]
     homes = [HOME]
     for pat in ("/Users/*", "/home/*"):
         for h in glob.glob(pat):
@@ -904,25 +950,28 @@ def collect(agent, include_sub):
     rows = sorted(best.values(), key=lambda r: -r["t"])
     return rows, errors
 
-def emit_index(agent, query, include_sub):
-    rows, _ = collect(agent, include_sub)
-    q = (query or "").lower()
+def emit_index(agent, query, include_sub, content=False):
+    sel, _ = _filter_rows(agent, query, include_sub, "all", content)
     out = []
-    for r in rows:
+    for r in sel:
         z = r.get("z") or ""
-        if q and q not in (r["n"] + " " + r["l"] + " " + z + " " + r["j"] + " " + r["i"]).lower():
-            continue
         tag = f'{r["a"]}·{r["s"]}'
         col = TAGC.get(tag, "")
         rolec = CY if r["r"] == "user" else MG
         who = "you" if r["r"] == "user" else (r["r"] or "-")
         lm = clean(r["l"], 110)
         zt = tail_disp(r["l"], z, 110, 110)
+        vis = len(lm) + (3 + len(zt) if zt else 0)
         if zt: lm += f' {DIM}⋯{R} {zt}'
+        lm += " " * max(0, 110 - vis)      # fixed width: keeps field 3 past the right edge
         disp = (f'{DIM}{rel(r["t"]):>4}{R} {col}{tag:<11}{R} {DIM}{r["i"][:8]:<8}{R} '
                 f'{BOLD}{clean(r["n"], 44):<44}{R} {GR}{clean(r["j"], 16):<16}{R} '
                 f'{rolec}{who:>6}:{R} {lm}')
-        out.append(esc(r["f"]) + "\t" + esc(disp))
+        # Field 3 is the full cached text. fzf matches fields 2.. but renders from the left with
+        # --no-hscroll, and the padding above puts field 3 ~205 columns in — so typing in the TUI
+        # searches everything the cache knows while only the columns stay on screen.
+        # (--nth can't do this: fzf applies --nth AFTER --with-nth, so a hidden field is unmatchable.)
+        out.append(esc(r["f"]) + "\t" + esc(disp) + "\t" + esc(row_hay(r)))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 # ------------------------------------------------------------- details / export
@@ -1117,19 +1166,33 @@ def do_doctor(include_sub):
         for e in errors[:10]: print(f"    ! {e}")
     print(f"  cache: {CACHE_FILE}")
 
-def _filter_rows(agent, query, include_sub, since_spec):
+def _filter_rows(agent, query, include_sub, since_spec, content=False):
+    """The single filter. Metadata match is free (cached); --content additionally opens the
+    newest SCAN_CAP non-matching transcripts and searches the conversation itself."""
     secs = since_seconds(since_spec)
     cutoff = (time.time() - secs) if secs is not None else None
     rows, _ = collect(agent, include_sub)
-    q = (query or "").lower()
+    terms = qterms(query)
     sel = []
+    scanned = skipped = 0
     for r in rows:
         if cutoff is not None and r["t"] < cutoff:
             break        # rows are sorted newest-first
-        if q and q not in (r["n"] + " " + r["l"] + " " + (r.get("z") or "")
-                           + " " + r["j"] + " " + r["i"]).lower():
+        if not terms or qmatch(terms, row_hay(r)):
+            sel.append(r)
             continue
-        sel.append(r)
+        if not content:
+            continue
+        if scanned >= SCAN_CAP:
+            skipped += 1     # never silently truncate — reported below
+            continue
+        scanned += 1
+        if qmatch(terms, body_text(r)):
+            sel.append(r)
+    if skipped:
+        sys.stderr.write(
+            f"transcripts: --content read the {scanned} newest transcripts; {skipped} older ones "
+            f"were NOT searched. Narrow with --since/--agent, or raise --scan (default {SCAN_CAP}).\n")
     return sel, secs
 
 def _pad(s, w):
@@ -1140,8 +1203,8 @@ def _pad_end(s, w):
     s = clean_end(s, w)
     return s + " " * (w - len(s))
 
-def emit_table(agent, query, include_sub, since_spec):
-    sel, secs = _filter_rows(agent, query, include_sub, since_spec)
+def emit_table(agent, query, include_sub, since_spec, content=False):
+    sel, secs = _filter_rows(agent, query, include_sub, since_spec, content)
     try: width = os.get_terminal_size(sys.__stdout__.fileno()).columns
     except Exception:
         try: width = int(os.environ.get("COLUMNS") or 120)
@@ -1186,8 +1249,8 @@ def emit_table(agent, query, include_sub, since_spec):
         out.append("nothing in this window — try --since=7d or --full-list")
     print("\n".join(out))
 
-def emit_plain(agent, query, include_sub, as_json, since_spec):
-    sel, _secs = _filter_rows(agent, query, include_sub, since_spec)
+def emit_plain(agent, query, include_sub, as_json, since_spec, content=False):
+    sel, _secs = _filter_rows(agent, query, include_sub, since_spec, content)
     for r in sel:
         if as_json:
             print(json.dumps({"id": r["i"], "source": f'{r["a"]}·{r["s"]}',
@@ -1202,13 +1265,13 @@ def emit_plain(agent, query, include_sub, as_json, since_spec):
                 clean(r["l"], 160), tail_disp(r["l"], r.get("z") or "", 160, 160), r["p"])))
 
 if CMD == "index":
-    emit_index(ARG1 or "all", ARG2, ARG3 == "1")
+    emit_index(ARG1 or "all", ARG2, ARG3 == "1", ARG4 == "1")
 elif CMD == "list":
-    emit_plain(ARG1 or "all", ARG2, ARG3 == "1", False, ARG4)
+    emit_plain(ARG1 or "all", ARG2, ARG3 == "1", False, ARG4, ARG5 == "1")
 elif CMD == "json":
-    emit_plain(ARG1 or "all", ARG2, ARG3 == "1", True, ARG4)
+    emit_plain(ARG1 or "all", ARG2, ARG3 == "1", True, ARG4, ARG5 == "1")
 elif CMD == "table":
-    emit_table(ARG1 or "all", ARG2, ARG3 == "1", ARG4)
+    emit_table(ARG1 or "all", ARG2, ARG3 == "1", ARG4, ARG5 == "1")
 elif CMD == "legend":
     print(f'{DIM}{"AGE":>4} {"SOURCE":<11} {"ID":<8} {"TITLE":<44} {"PROJECT":<16} {"FROM":>6}  LAST MESSAGE HEAD ⋯ TAIL{R}')
 elif CMD == "details":
@@ -1266,16 +1329,20 @@ do_install() {
   echo "open a new shell (or: export PATH=\"\$HOME/.local/bin:\$PATH\") and run: transcripts"
 }
 
-usage() { sed -n '2,33p' "$SELF" | sed 's/^# \{0,1\}//'; }
+# print the header comment block, however long it grows
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$SELF"; }
 
 # ---------------------------------------------------------------- arg parsing
-AGENT="" QUERY="" SUB=0 CMD="" MODE="" SINCE=""
+AGENT="" QUERY="" SUB=0 CMD="" MODE="" SINCE="" CONTENT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --agent=*) AGENT="${1#*=}" ;;
     --agent|-a) shift; AGENT="${1:-}" ;;
     --query=*) QUERY="${1#*=}" ;;
     --query|-q) shift; QUERY="${1:-}" ;;
+    --content|-c) CONTENT=1 ;;
+    --scan=*) export TRANSCRIPTS_SCAN="${1#*=}" ;;
+    --scan) shift; export TRANSCRIPTS_SCAN="${1:-}" ;;
     --list|-l|--print) MODE=list ;;
     --json) MODE=json ;;
     --table) MODE=table ;;
@@ -1294,10 +1361,11 @@ while [ $# -gt 0 ]; do
     __details) run_py details "${2:-}"; exit $? ;;
     __export) run_py export "${2:-}"; exit $? ;;
     __copy) copy_ref_path "${2:-}"; exit 0 ;;
-    __reload) # __reload STATE SUB [next]
-      st="${2:-}"; sb="${3:-0}"
-      [ "${4:-}" = "next" ] && cycle_state "$st"
-      run_py index "$(state_agent "$st")" "" "$sb"; exit $? ;;
+    __reload) # __reload STATE SUB QUERY [next|content]
+      st="${2:-}"; sb="${3:-0}"; q="${4:-}"; md="${5:-}"
+      [ "$md" = "next" ] && cycle_state "$st"
+      run_py index "$(state_agent "$st")" "$q" "$sb" \
+        "$([ "$md" = "content" ] && echo 1 || echo 0)"; exit $? ;;
     *) echo "transcripts: unknown option $1 (see --help)"; exit 1 ;;
   esac
   shift
@@ -1313,7 +1381,11 @@ if [ -n "$MODE" ]; then
     if [ -t 1 ]; then FMT=table; else FMT=list; fi
   elif [ "$MODE" = tsv ]; then FMT=list
   fi
-  run_py "$FMT" "${AGENT:-all}" "$QUERY" "$SUB" "${SINCE:-24h}"
+  # searching a 24h window is a surprise, not a default: a query means "look everywhere"
+  if [ -z "$SINCE" ]; then
+    if [ -n "$QUERY" ]; then SINCE=all; else SINCE=24h; fi
+  fi
+  run_py "$FMT" "${AGENT:-all}" "$QUERY" "$SUB" "$SINCE" "$CONTENT"
   exit $?
 fi
 
@@ -1345,17 +1417,19 @@ if command -v fzf >/dev/null 2>&1 && [ -z "${TRANSCRIPTS_NO_FZF:-}" ]; then
   SELQ="'$SELF'"
   LEGEND="  $(run_py legend)"
   HDR="$LEGEND
- ⏎ pick (copies path) · ⇥ show/hide transcript · ^A switch agent · ^E export .md · ^Y copy path · ^R refresh · esc quit"
-  sel="$(run_py index "$AGENT" "" "$SUB" | fzf \
-    --ansi --delimiter='\t' --with-nth=2.. --tiebreak=index \
-    --query="$QUERY" --info=inline \
-    --prompt="  $AGENT › type to filter: " \
+ ⏎ pick (copies path) · ⇥ show/hide transcript · ^F search inside transcripts · ^A switch agent
+ ^E export .md · ^Y copy path · ^R refresh (back to fast filter) · esc quit"
+  sel="$(run_py index "$AGENT" "$QUERY" "$SUB" "$CONTENT" | fzf \
+    --ansi --delimiter='\t' --with-nth=2.. --no-hscroll --tiebreak=index \
+    --exact --info=inline \
+    --prompt="  $AGENT ${QUERY:+[$QUERY] }› type to filter: " \
     --header="$HDR" \
     --preview="$SELQ __details {1}" \
     --preview-window='down:60%:wrap' \
     --bind='tab:toggle-preview' \
-    --bind="ctrl-a:reload($SELQ __reload '$STATE' $SUB next)" \
-    --bind="ctrl-r:reload($SELQ __reload '$STATE' $SUB)" \
+    --bind="ctrl-f:reload($SELQ __reload '$STATE' $SUB {q} content)+change-prompt(  $AGENT › matched inside transcripts, refine: )+clear-query" \
+    --bind="ctrl-a:reload($SELQ __reload '$STATE' $SUB '' next)+change-prompt(  $AGENT › type to filter: )+clear-query" \
+    --bind="ctrl-r:reload($SELQ __reload '$STATE' $SUB '')+change-prompt(  $AGENT › type to filter: )" \
     --bind="ctrl-y:execute-silent($SELQ __copy {1})" \
     --bind="ctrl-e:execute-silent($SELQ __export {1})" \
   )"
@@ -1392,7 +1466,7 @@ fi
 echo "tip: 'brew install fzf' unlocks the nicer TUI (live fuzzy filter + preview pane)." >&2
 OFF=0; PAGE=25
 while :; do
-  LIST="$(run_py index "$(state_agent "$STATE")" "$QUERY" "$SUB")"
+  LIST="$(run_py index "$(state_agent "$STATE")" "$QUERY" "$SUB" "$CONTENT")"
   TOTAL=$(printf '%s' "$LIST" | grep -c . || true)
   echo
   printf '\033[1m── transcripts · agent: %s%s · %s found ──\033[0m\n' \
@@ -1407,14 +1481,15 @@ while :; do
   fi
   echo
   echo "  type a #      open that transcript (latest messages first)"
-  echo "  /words        filter list (e.g. /oauth bug) · / alone clears"
-  echo "  a=switch agent  n=next page  p=prev page  s=toggle subagents  q=quit"
+  echo "  /words        filter list (all words must match) · / alone clears"
+  echo "  a=switch agent  n=next page  p=prev page  s=toggle subagents  c=search inside  q=quit"
   printf '› '
   read -r ans || exit 0
   case "$ans" in
     q) exit 0 ;;
     a) cycle_state "$STATE"; OFF=0 ;;
     s) SUB=$((1 - SUB)); OFF=0 ;;
+    c) CONTENT=$((1 - CONTENT)); OFF=0 ;;
     n) [ $((OFF + PAGE)) -lt "$TOTAL" ] && OFF=$((OFF + PAGE)) ;;
     p) OFF=$((OFF - PAGE)); [ "$OFF" -lt 0 ] && OFF=0 ;;
     /*) QUERY="${ans#/}"; OFF=0 ;;
