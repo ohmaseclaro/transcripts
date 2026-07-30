@@ -1,5 +1,59 @@
 # Changelog
 
+## 1.11.0
+
+**A directory filter, and a review pass over everything else.**
+
+### `--dir` / `-d`
+
+`transcripts -d . -a claude` lists every Claude session run in this directory tree, wherever the
+transcript itself is stored. `-d ~/code` covers every project underneath, `--here` is shorthand
+for `$PWD`, and prefix-sharing siblings (`api` vs `api-gateway`) stay out. It matches on the
+working directory recorded inside each session, falling back to decoding the slugged project
+folder name (`/Users/me/api` → `-Users-me-api`) against the real filesystem when a session
+doesn't record one — including for directories that have since been deleted. `--doctor` now
+reports how many sessions have a resolvable directory.
+
+### Bugs
+
+- **`--content` only ever searched the last 2 MB of a Claude session.** Anything earlier in a
+  long conversation was unfindable; it now reads the whole file.
+- **Colour was emitted into pipes.** `--details`, `--table` and the highlight escapes all leaked
+  ANSI into redirected output, so anything parsing it got escape codes. Colour is now terminal-
+  only, honouring `NO_COLOR` / `FORCE_COLOR`.
+- **A piped run with no explicit mode printed nothing at all** — it launched fzf, which failed
+  invisibly against a pipe. Piping now implies `--list`.
+- **Emoji and CJK broke every column to their right**: padding counted characters, not display
+  width.
+- **`--details REF -q term` only highlighted when `-q` came first**, because actions ran during
+  argument parsing. Actions now run after the whole command line is read.
+- **Highlighting reset the surrounding style**, so the rest of a matched title lost its colour.
+- **Cursor databases were reopened — and, when Cursor held the lock, re-copied — once per row**
+  under `--content`. Connections are now pooled (measured 1.8× faster with Cursor closed; far
+  more when it is running), and composer bubbles are fetched in one range scan instead of one
+  query each.
+- **More than 1000 Cursor composers in a database were silently dropped.** The cap is now 4000,
+  configurable via `TRANSCRIPTS_KV_CAP`, and exceeding it is reported instead of hidden.
+- A composer with no usable timestamp sorted as 1970; it now falls back to the store's mtime.
+- Store read errors were swallowed everywhere except `--doctor`; results that may be incomplete
+  now say so on stderr.
+- `--scan` with a non-numeric value silently became 300; it is now an error.
+- A `|` in a transcript path corrupted the parsed ref.
+- The fzf prompt kept showing the old agent after `ctrl-a` (now re-rendered, on fzf ≥ 0.45).
+- Narrow terminals got a 110-column table that wrapped into noise; columns are now dropped to
+  fit.
+
+### For agents
+
+- `--details 'REF' --json` — the conversation as structured data: chronological messages with
+  `role`, `text`, `ts` and a per-message `matched` flag, plus `message_count` / `truncated`.
+- `--export 'REF' -o -` writes markdown to stdout; `-o PATH` writes where you choose.
+- `--json` gains `agent`, `store`, `updated_iso`, `dir` and `subagent`, and no longer truncates
+  the cached message head/tail. `--tsv` gains a `dir` column before `path`.
+- `--since` accepts weeks (`2w`).
+- "nothing matched" now names the filter that emptied the result instead of always blaming the
+  time window.
+
 ## 1.10.0
 
 **See why a session matched, without scrolling for it.**

@@ -11,10 +11,11 @@ trap 'rm -rf "$HOME_DIR"' EXIT
 PROJ="$HOME_DIR/.claude/projects/-Users-nobody-demo"
 mkdir -p "$PROJ"
 
-# msg FILE ROLE TEXT TIMESTAMP
+# msg FILE ROLE TEXT TIMESTAMP [CWD]
 msg() {
   python3 -c 'import json,sys
-print(json.dumps({"type": sys.argv[2], "timestamp": sys.argv[4], "cwd": "/Users/nobody/demo",
+print(json.dumps({"type": sys.argv[2], "timestamp": sys.argv[4],
+                  "cwd": sys.argv[5] if len(sys.argv) > 5 else "/Users/nobody/demo",
                   "message": {"role": sys.argv[2], "content": sys.argv[3]}}))' "$@" >> "$1"
 }
 
@@ -108,8 +109,8 @@ REF="cc|$R|aaaaaaaa-1111-2222-3333-444444444444"
 HL_ON=$'\033[30;43m'
 has() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 
-D_PLAIN="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __details "$REF" 2>/dev/null)"
-D_HL="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __details "$REF" "rotation" 2>/dev/null)"
+D_PLAIN="$(TRANSCRIPTS_HOME="$HOME_DIR" FORCE_COLOR=1 "$TR" __details "$REF" 2>/dev/null)"
+D_HL="$(TRANSCRIPTS_HOME="$HOME_DIR" FORCE_COLOR=1 "$TR" __details "$REF" "rotation" 2>/dev/null)"
 
 if has "$HL_ON" "$D_HL"; then PASS=$((PASS + 1)); echo "  ok   details highlights the query"
 else FAIL=$((FAIL + 1)); echo "  FAIL details did not highlight the query"; fi
@@ -140,11 +141,118 @@ else PASS=$((PASS + 1)); echo "  ok   deep match window starts near the match, n
 ST="$HOME_DIR/state"; printf 'all\n' > "$ST"
 TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __reload "$ST" 0 "pineapple" content >/dev/null 2>&1
 ok "ctrl-f stores the sticky query" "pineapple" "$(sed -n 2p "$ST")"
-D_STICKY="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __details "$REF" "" "$ST" 2>/dev/null)"
+D_STICKY="$(TRANSCRIPTS_HOME="$HOME_DIR" FORCE_COLOR=1 "$TR" __details "$REF" "" "$ST" 2>/dev/null)"
 if has "$HL_ON" "$D_STICKY"; then PASS=$((PASS + 1)); echo "  ok   preview highlights from the sticky query"
 else FAIL=$((FAIL + 1)); echo "  FAIL sticky query not used by the preview"; fi
 TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __reload "$ST" 0 "" >/dev/null 2>&1
 ok "ctrl-r clears the sticky query" "" "$(sed -n 2p "$ST")"
+
+# 10. --dir: scope by the directory a session ran in, including subdirs
+WORK="$HOME_DIR/work"
+mkdir -p "$WORK/api/internal" "$WORK/api-gateway" "$WORK/web"
+dirsession() { # dirsession SLUG CWD ID TEXT
+  local d="$PROJ/../$1"; mkdir -p "$d"
+  msg "$d/$3.jsonl" user "$4" "2026-07-27T10:00:00Z" "$2"
+}
+dirsession "-work-api"          "$WORK/api"          "cccc0001-0000-0000-0000-000000000001" "api session"
+dirsession "-work-api-internal" "$WORK/api/internal" "cccc0002-0000-0000-0000-000000000002" "nested session"
+dirsession "-work-api-gateway"  "$WORK/api-gateway"  "cccc0003-0000-0000-0000-000000000003" "sibling session"
+dirsession "-work-web"          "$WORK/web"          "cccc0004-0000-0000-0000-000000000004" "web session"
+
+ok "--dir matches the dir itself and its subdirs" 2 "$(count "$(run --tsv -d "$WORK/api")")"
+ok "--dir does not leak into prefix-sharing siblings" 1 "$(count "$(run --tsv -d "$WORK/api-gateway")")"
+ok "--dir at the parent catches every project below" 4 "$(count "$(run --tsv -d "$WORK")")"
+ok "--dir combines with a query" 1 "$(count "$(run --tsv -d "$WORK" -q nested)")"
+ok "--dir ignores the 24h window like a query does" 4 "$(count "$(run --tsv -d "$WORK")")"
+
+# a directory that no longer exists must still resolve, via the slugged store path
+DEAD="$WORK/deleted-project"; mkdir -p "$DEAD"
+dirsession "-work-deleted-project" "$DEAD" "cccc0005-0000-0000-0000-000000000005" "ghost session"
+rmdir "$DEAD"
+ok "--dir still finds sessions whose directory was deleted" 1 \
+   "$(count "$(run --tsv -d "$DEAD")")"
+
+WARN="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" --tsv -d "$HOME_DIR/definitely-not-here" 2>&1 >/dev/null)"
+case "$WARN" in
+  *"does not exist"*) PASS=$((PASS + 1)); echo "  ok   --dir warns about a nonexistent directory" ;;
+  *) FAIL=$((FAIL + 1)); echo "  FAIL --dir said nothing about a nonexistent directory" ;;
+esac
+
+D_JSON="$(run --json -d "$WORK/api" | head -1)"
+case "$D_JSON" in
+  *'"dir"'*"$WORK/api"*) PASS=$((PASS + 1)); echo "  ok   --json reports the session directory" ;;
+  *) FAIL=$((FAIL + 1)); echo "  FAIL --json is missing the dir field" ;;
+esac
+
+# 11. print modes must be machine-clean: no ANSI unless a terminal (or FORCE_COLOR) asks
+for m in --tsv --json --table; do
+  if run $m -s 7d | grep -q $'\033'; then
+    FAIL=$((FAIL + 1)); echo "  FAIL $m emits ANSI escapes when piped"
+  else PASS=$((PASS + 1)); echo "  ok   $m is escape-free when piped"; fi
+done
+if TRANSCRIPTS_HOME="$HOME_DIR" FORCE_COLOR=1 "$TR" --table -s 7d 2>/dev/null | grep -q $'\033'; then
+  PASS=$((PASS + 1)); echo "  ok   FORCE_COLOR restores colour"
+else FAIL=$((FAIL + 1)); echo "  FAIL FORCE_COLOR did not restore colour"; fi
+if TRANSCRIPTS_HOME="$HOME_DIR" NO_COLOR=1 FORCE_COLOR=1 "$TR" __details "$REF" "rotation" 2>/dev/null | grep -q $'\033'; then
+  FAIL=$((FAIL + 1)); echo "  FAIL NO_COLOR did not win over FORCE_COLOR"
+else PASS=$((PASS + 1)); echo "  ok   NO_COLOR wins over FORCE_COLOR"; fi
+
+# 12. structured detail output for agents
+DJ="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" --details "$REF" -q rotation --json 2>/dev/null)"
+echo "$DJ" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+assert d["order"] == "chronological", d["order"]
+assert d["message_count"] > 0, d
+assert d["match_count"] >= 1, d
+assert any(m["matched"] for m in d["messages"]), "no message flagged as matched"
+assert all(set(m) == {"role","text","ts","matched"} for m in d["messages"])
+' && { PASS=$((PASS+1)); echo "  ok   --details --json is structured and flags matches"; } \
+  || { FAIL=$((FAIL+1)); echo "  FAIL --details --json malformed"; }
+
+# 13. flag order must not change behaviour
+A="$(count "$(run --tsv -q widget -d "$HOME_DIR")")"
+B="$(count "$(run --tsv -d "$HOME_DIR" -q widget)")"
+ok "filter flags are order-independent" "$A" "$B"
+DA="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" --details "$REF" -q rotation 2>/dev/null | head -6)"
+DB="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" -q rotation --details "$REF" 2>/dev/null | head -6)"
+ok "--details before -q behaves like -q before --details" "$DA" "$DB"
+
+# 14. export to stdout, and to a chosen path
+EX="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" --export "$REF" -o - 2>/dev/null)"
+case "$EX" in
+  \#*"- id:"*) PASS=$((PASS + 1)); echo "  ok   --export -o - writes markdown to stdout" ;;
+  *) FAIL=$((FAIL + 1)); echo "  FAIL --export -o - produced no markdown" ;;
+esac
+OUTF="$HOME_DIR/out.md"
+TRANSCRIPTS_HOME="$HOME_DIR" "$TR" --export "$REF" -o "$OUTF" >/dev/null 2>&1
+if [ -s "$OUTF" ]; then PASS=$((PASS + 1)); echo "  ok   --export -o FILE writes there"
+else FAIL=$((FAIL + 1)); echo "  FAIL --export -o FILE wrote nothing"; fi
+
+# 15. week windows, and a bad --since must fail loudly rather than default to something
+if run --tsv -s 2w >/dev/null 2>&1; then PASS=$((PASS + 1)); echo "  ok   --since accepts weeks"
+else FAIL=$((FAIL + 1)); echo "  FAIL --since 2w rejected"; fi
+if TRANSCRIPTS_HOME="$HOME_DIR" "$TR" --tsv -s bogus >/dev/null 2>&1; then
+  FAIL=$((FAIL + 1)); echo "  FAIL --since bogus was accepted"
+else PASS=$((PASS + 1)); echo "  ok   --since rejects nonsense"; fi
+
+# 16. wide characters must not break column alignment
+WIDE="$PROJ/dddddddd-0000-0000-0000-00000000000e.jsonl"
+msg "$WIDE" user "🎉🎉🎉 emoji title session 日本語テキスト" "2026-07-27T10:00:00Z"
+ROWS="$(TRANSCRIPTS_HOME="$HOME_DIR" COLUMNS=140 "$TR" --table -s 7d 2>/dev/null \
+        | grep '^│' | grep -v '⤷' | python3 -c '
+import sys, unicodedata
+def w(s):
+    t = 0
+    for ch in s:
+        if unicodedata.combining(ch): continue
+        o = ord(ch)
+        t += 2 if unicodedata.east_asian_width(ch) in ("W","F") or 0x1F300 <= o <= 0x1FAFF \
+                  or 0x2600 <= o <= 0x27BF else 1
+    return t
+ws = {w(l.rstrip("\n")) for l in sys.stdin}
+print(len(ws))')"
+ok "table rows all render at one width (emoji/CJK safe)" 1 "$ROWS"
 
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

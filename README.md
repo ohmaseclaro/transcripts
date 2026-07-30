@@ -37,6 +37,8 @@ git clone https://github.com/ohmaseclaro/transcripts.git
 
 Installer knobs: `TRANSCRIPTS_BIN` (install dir), `TRANSCRIPTS_REF` (branch/tag), `TRANSCRIPTS_NO_SKILL=1` (CLI only).
 
+**Colour goes to terminals only.** Piped output is plain text, so `--tsv`, `--json`, `--details` and `--export` are safe to parse. `NO_COLOR` and `FORCE_COLOR` are both honoured.
+
 ## Privacy
 
 This tool is entirely local. It reads the transcript stores your agents already wrote to your disk, caches parsed metadata under `~/.cache/transcripts-tui/`, and writes markdown only when you ask for `--export`. Nothing is uploaded, and there is no network code in it at all — `install.sh` is the only file that touches the network.
@@ -61,6 +63,7 @@ Other readable macOS/Linux account homes on the machine are scanned too. Databas
 transcripts                    # agent picker, then browse
 transcripts -a claude          # only claude (also: cursor, all)
 transcripts -q "oauth bug"     # start pre-filtered
+transcripts -d .               # only sessions from this directory tree
 ```
 
 With fzf installed:
@@ -70,7 +73,7 @@ With fzf installed:
 | type     | filter — every word must match, over title, project, id and the last message |
 | `enter`  | pick — prints the transcript path and copies it to the clipboard |
 | `tab`    | show/hide the transcript preview pane — matches are highlighted and shown first |
-| `ctrl-f` | search *inside* the transcripts for what you typed (see [Searching](#searching)) |
+| `ctrl-f` | search *inside* the transcripts for what you typed (see [Filtering](#filtering)) |
 | `ctrl-a` | cycle agent: all → claude → cursor |
 | `ctrl-e` | export the highlighted transcript to `~/Downloads/*.md` |
 | `ctrl-y` | copy path without leaving the list |
@@ -79,7 +82,26 @@ With fzf installed:
 
 Without fzf you get a numbered-list fallback: type a number to open, `/words` to filter, `a` switch agent, `n`/`p` page, `s` toggle subagents, `c` toggle searching inside transcripts, `q` quit.
 
-## Searching
+## Filtering
+
+Filters combine (AND) and are applied cheapest-first: time window → `--dir` → query → `--content`. **Any filter turns off the implicit 24h window** — only an unfiltered `--list` still shows just today.
+
+### By directory
+
+```sh
+transcripts -d .                   # every session run in this tree
+transcripts -d . -a claude         # …from Claude only
+transcripts -d ~/code --json       # every project under ~/code, for a script
+transcripts --here                 # shorthand for -d "$PWD"
+```
+
+`--dir`/`-d` scopes to sessions whose **working directory** is that path or anywhere below it — so `-d ~/code` finds sessions from `~/code/api`, `~/code/api/internal`, and any other repo nested in there. Sibling directories that merely share a prefix (`~/code/api-gateway` vs `~/code/api`) are not included.
+
+Both tools keep transcripts in one central store and name each project folder after the slugged working directory (`/Users/me/api` → `-Users-me-api`), which is lossy — `-` could be a separator or part of a name. So `-d` reads the working directory recorded *inside* the session, and only falls back to decoding that folder name (resolved against the real filesystem) when the session doesn't record one. `--doctor` reports how many sessions have a known directory; Cursor CLI chats started outside a project are the usual gap.
+
+A directory that no longer exists still works — matching falls back to the stored path — you just get a warning that it's gone.
+
+### By text
 
 A query is split on whitespace and **every word must match** (case-insensitive substring, any order). The TUI, the table, the TSV and the JSON all agree on what a query means.
 
@@ -95,12 +117,12 @@ transcripts -q oauth -c -s 7d --scan 800   # narrow the window, scan deeper
 
 ```
 transcripts: --content read the 300 newest transcripts; 3030 older ones were NOT searched.
-Narrow with --since/--agent, or raise --scan (default 300).
+Narrow with --since/--agent/--dir, or raise --scan (default 300).
 ```
 
-Narrowing first (`-a claude`, `-s 7d`) is almost always faster than raising `--scan`.
+Narrowing first (`-d .`, `-a claude`, `-s 7d`) is almost always faster than raising `--scan`.
 
-**A query implies `--since all`.** Without a query, `--list` shows the last 24h; with one, it searches all time unless you pass `--since` yourself.
+Windows are `Nm` / `Nh` / `Nd` / `Nw` (`-s 30m`, `-s 2w`) or `all`. Anything else is rejected rather than silently ignored.
 
 ### Seeing why something matched
 
@@ -123,9 +145,11 @@ transcripts --full-list                # everything, no time window
 transcripts --table                    # force the pretty table (even piped)
 transcripts --tsv                      # force raw TSV (even on a terminal)
 transcripts --json                     # one JSON object per line
-transcripts --list -a cursor -q "retry wrapper" # combine with --agent / --query / --subagents
+transcripts --list -a cursor -q "retry wrapper" # combine with --agent / --query / --dir / --subagents
 transcripts --json -q "retry wrapper" --content # search inside the transcripts too
 ```
+
+Piping implies `--list`: `transcripts -d . | head` gives you TSV, not a broken TUI.
 
 `--since`/`--full-list` imply `--list`. Value flags accept both `--flag value` and `--flag=value`.
 
@@ -133,9 +157,9 @@ transcripts --json -q "retry wrapper" --content # search inside the transcripts 
 
 Table: `ID · SOURCE · UPDATED · TITLE · LAST MESSAGE HEAD · LAST MESSAGE TAIL`, with the transcript's file path on a second line under each row. Table width follows the terminal (`COLUMNS` respected).
 
-TSV columns: `id, source, updated, title, last message head, last message tail, path`.
+TSV columns: `id, source, updated, title, last message head, last message tail, dir, path`.
 
-JSON keys: `id, source, updated, updated_ts, title, project, last_role, last_message_head, last_message_tail, path, ref`.
+JSON keys: `id, source, agent, store, updated, updated_ts, updated_iso, title, project, dir, subagent, last_role, last_message_head, last_message_tail, path, ref`.
 
 **Head / tail semantics:** head is the start of the session's last message; tail is its actual ending — it always ends with the message's final characters (truncation cuts from the front, `…` prefix). Tail is empty only when the head cell already shows the entire message. The head carries a role prefix: `you:` for your messages, `claude:`/`cursor:` for the agent.
 
@@ -148,9 +172,15 @@ The title is the real chat window name whenever one exists, resolved in priority
 Every row has a stable ref (shown by `--json` as `ref`, and printed after a TUI pick):
 
 ```sh
-transcripts --details 'cc|/path/to/session.jsonl|<session-id>'   # last messages, newest first
-transcripts --export  'cc|/path/to/session.jsonl|<session-id>'   # write markdown to ~/Downloads
+transcripts --details 'REF'                # last messages, newest first
+transcripts --details 'REF' -q oauth       # …opening on the matches, hits highlighted
+transcripts --details 'REF' --json         # structured: chronological messages + match flags
+transcripts --export  'REF'                # markdown into ~/Downloads
+transcripts --export  'REF' -o -           # markdown to stdout
+transcripts --export  'REF' -o out.md      # markdown to a path (or a directory)
 ```
+
+`--details --json` gives an agent the conversation without ANSI or truncation: `{ref, type, path, id, title, updated_iso, message_count, truncated, order, match_count, messages: [{role, text, ts, matched}]}`.
 
 Ref prefixes: `cc` claude jsonl · `cs` cursor CLI db · `ca` cursor composer · `cl` cursor legacy tab · `cj` cursor subagent jsonl. Quote refs — they contain `|`.
 
@@ -173,6 +203,8 @@ Parsed results are cached in `~/.cache/transcripts-tui/index-v5.json`, keyed by 
 | `TRANSCRIPTS_HOME`    | scan **only** this dir as "home" instead of `~` and every other readable account home (used by the tests) |
 | `TRANSCRIPTS_NO_FZF`  | set to force the no-fzf fallback TUI |
 | `TRANSCRIPTS_SCAN`    | default `--content` scan cap (default 300) |
+| `TRANSCRIPTS_KV_CAP`  | max Cursor composer records read per database (default 4000) |
+| `NO_COLOR`            | never emit colour (`FORCE_COLOR` forces it back on) |
 | `COLUMNS`             | table width when the terminal size can't be detected |
 
 ## Troubleshooting

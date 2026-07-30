@@ -30,16 +30,32 @@ Always use machine-readable output when you are the consumer:
 ```sh
 transcripts --json --since 7d                      # everything recent, one JSON per line
 transcripts --json --since 2d -a claude            # only claude (also: cursor, all)
+transcripts --json -d .                            # sessions run in THIS directory tree
 transcripts --json -q "oauth bug"                  # title + last message + project + id, all time
 transcripts --json -q oauth --content              # ALSO search inside the conversations
 ```
 
-Each line has: `id, source, updated, updated_ts, title, project, last_role,
-last_message_head, last_message_tail, path, ref`.
+Each line has: `id, source, agent, store, updated, updated_ts, updated_iso, title, project,
+dir, subagent, last_role, last_message_head, last_message_tail, path, ref`.
 
 Picking the right session: `title` is the real chat-window name; `last_message_head`/`_tail`
 show how the conversation started ending and how it actually ended — the tail is usually the
 strongest signal of where a session left off.
+
+**Scope by directory first — it is free and it is usually what the user means.**
+
+`-d PATH` keeps only sessions whose working directory is PATH or anywhere below it. When the
+user says "this project", "here", or "what did we do in the api repo", start with `-d`:
+
+```sh
+transcripts --json -d .                    # this tree, any agent, all time
+transcripts --json -d . -a claude -s 7d    # narrower still
+transcripts --json -d ~/code/api -q auth   # combine freely — filters AND together
+```
+
+Sessions whose directory was never recorded (mostly Cursor CLI chats started outside a project)
+cannot match `-d`. If a `-d` search comes back empty and you expected hits, retry without it
+before concluding nothing exists.
 
 **Two search depths, and the difference matters:**
 
@@ -60,11 +76,22 @@ when listing. Add `--subagents` if the user means a background/subagent run.
 Two levels, depending on how much context is needed:
 
 ```sh
-transcripts --details 'REF'      # last ~14 messages, newest first — quick context recovery
-transcripts --export 'REF'       # full transcript → markdown file in ~/Downloads (prints path)
+transcripts --details 'REF'             # last ~14 messages, newest first — quick context
+transcripts --details 'REF' --json      # STRUCTURED: every message as JSON — prefer this
+transcripts --details 'REF' -q oauth    # opens on the matching messages, not the newest
+transcripts --export 'REF' -o -         # full transcript as markdown on stdout
+transcripts --export 'REF'              # …or written to ~/Downloads (prints the path)
 ```
 
 `REF` is the `ref` field from the JSON — always single-quote it (contains `|`).
+
+`--details --json` is the one to reach for: `{ref, type, path, id, title, updated_iso,
+message_count, truncated, order, match_count, messages: [{role, text, ts, matched}]}`, in
+chronological order, with no ANSI and no per-message truncation. With `-q`, `matched` tells you
+exactly which messages hit the query. Use `--export 'REF' -o -` when you want the whole thing as
+readable markdown in one blob instead.
+
+Output is plain text whenever it is piped, so nothing here needs escape-code stripping.
 
 For Claude sessions (`ref` starting `cc|`) you can also read the `path` jsonl directly for
 full fidelity (every line is a JSON event; message text lives in `.message.content`). Cursor
@@ -79,6 +106,10 @@ said. Include the session's `path` so the user can point other tools at it.
 
 ## Examples
 
+**"continue where we left off"** (user is in a project directory)
+→ `transcripts --json -d . -s 7d` → pick newest by `updated_ts` → `transcripts --details 'REF'
+--json` → summarize state + open threads, then continue the work.
+
 **"continue where my last billing session left off"**
 → `transcripts --json --since 3d -q billing` → pick newest by `updated_ts` → `--details 'REF'`
 → summarize state + open threads, then continue the work.
@@ -89,11 +120,13 @@ each relevant ref → report per-session outcomes.
 
 **"find that conversation where we decided the firecrawl key strategy"**
 → `transcripts --json -q firecrawl` → nothing? the decision was mid-conversation, so metadata
-search can't see it: `transcripts --json -q firecrawl --content -s 30d` → `--export 'REF'` and
-search the markdown for the decision.
+search can't see it: `transcripts --json -q firecrawl --content -s 30d` (add `-d .` if it was
+this project) → then `transcripts --details 'REF' -q firecrawl --json` and read the messages
+flagged `matched`.
 
 ## Notes
 
+- `transcripts -d . -a claude` is the fastest way to answer "what has been done in this repo".
 - Sessions titled with a first-message snippet had no real title (typically headless/scheduled
   runs) — judge those by `project` and message columns instead.
 - `transcripts --doctor` diagnoses missing stores, parse errors, and title-resolution stats.

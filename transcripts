@@ -13,43 +13,70 @@
 #   transcripts                        # agent picker, then TUI
 #   transcripts --agent cursor         # only cursor (also: claude, all) · short: -a
 #   transcripts --query "oauth bug"    # start pre-filtered · short: -q
+#   transcripts --dir ~/code/api       # only sessions run in that dir or below · short: -d
+#   transcripts --here                 # shorthand for --dir "$PWD"
 #   transcripts --list                 # NON-INTERACTIVE: pretty table on a terminal,
-#                                      #   raw TSV when piped (id, source, updated, title,
-#                                      #   last message head, last message tail, path)
-#                                      #   · combines with --agent/--query/
-#                                      #   --subagents · shows last 24h by default
+#                                      #   raw TSV when piped · combines with every filter
+#                                      #   · shows last 24h unless a filter says otherwise
 #   transcripts --json                 # same rows, one JSON object per line
 #   transcripts --table | --tsv        # force the pretty table / force raw TSV
-#   transcripts --list --since 10d     # look-back window: Nd / Nh / Nm · short: -s
+#   transcripts --list --since 10d     # look-back window: Nm / Nh / Nd / Nw · short: -s
 #   transcripts --list --full-list     # no time window: list everything
 #   transcripts --subagents            # include cursor subagent/background transcripts (no short)
-#   transcripts --details 'REF'        # print detail view for a ref
+#   transcripts --scan 800             # how many transcripts --content may open (default 300)
+#   transcripts --details 'REF'        # print detail view for a ref (add --json for structured)
+#   transcripts --export 'REF' -o -    # markdown to stdout ('-'), a file, or a dir · default
+#                                      #   ~/Downloads
 #   transcripts --doctor               # show what was found where (debugging)
 #   transcripts --install              # symlink into ~/.local/bin + add to PATH
 #
-# Searching:
-#   A query is split on whitespace and EVERY word must match (case-insensitive substring).
-#   By default only cached metadata is searched — title, project, session id, and the first
-#   and last 300 chars of the newest message. That is instant but shallow.
-#     transcripts -q "oauth bug" --list          # metadata only (fast)
-#     transcripts -q oauth --content --list      # also read the conversations (slow)
-#     transcripts -q oauth -c -s 7d --scan 800   # narrow the window, scan deeper
-#   --content/-c opens each non-matching transcript and searches the messages themselves.
-#   It stops after --scan transcripts (default 300, newest first) and says so on stderr.
-#   Giving a query drops the implicit 24h window: -q searches all time unless --since says
-#   otherwise. Typing in the TUI uses the same rule (fzf --exact over the same text), so the
-#   list, the table and the TUI all agree on what a query means.
+# Filtering:
+#   Filters combine (AND) and are applied cheapest-first: time window, then --dir, then the
+#   query, then --content. ANY filter turns off the implicit 24h window — an unfiltered
+#   --list still shows just today.
+#
+#   --dir/-d PATH   sessions whose working directory is PATH or anywhere below it. Claude and
+#                   Cursor store transcripts in central locations, naming each project dir
+#                   after the slugged cwd (/Users/me/api → -Users-me-api), so this reads the
+#                   cwd recorded in the session and falls back to decoding that name.
+#                   `transcripts -d . -a claude` = every claude session for this tree.
+#                   --doctor reports how many sessions have a known directory.
+#
+#   -q WORDS        split on whitespace, EVERY word must match (case-insensitive substring).
+#                   Searches cached metadata only: title, project, session id, and the first
+#                   and last 300 chars of the newest message. Instant, but blind to the middle
+#                   of a conversation.
+#   --content/-c    ALSO read each non-matching transcript and search its messages. Slow. Stops
+#                   after --scan transcripts (default 300, newest first) and says so on stderr.
+#                   Narrowing with -d/-a/-s first beats raising --scan.
+#
+#     transcripts -q "oauth bug"                 # metadata only (fast)
+#     transcripts -d . -q oauth -c               # this tree, searching inside the transcripts
+#     transcripts -a claude -s 2w -c -q rotation # last two weeks of claude, deep search
+#
+#   Typing in the TUI uses the same matcher (fzf --exact over the same text), so the list, the
+#   table and the TUI agree on what a query means.
 #
 #   With a query, the transcript view highlights every hit and opens on the matching messages
 #   rather than the newest one — including matches deep inside a long message, which it windows
-#   into view. Same for `--details REF` when -q comes first.
+#   into view. Same for `--details REF -q term`.
+#
+# For scripts and agents:
+#   --json      one object per line: id, source, agent, store, updated, updated_ts, updated_iso,
+#               title, project, dir, subagent, last_role, last_message_head, last_message_tail,
+#               path, ref
+#   --tsv       id, source, updated, title, head, tail, dir, path
+#   --details 'REF' --json    the conversation itself: chronological messages with role, text,
+#               ts and a "matched" flag per message (with -q), plus message_count/truncated
+#   --export 'REF' -o -       full transcript as markdown on stdout
+#   Colour is emitted only to a terminal. NO_COLOR disables it, FORCE_COLOR forces it on.
 #
 # Keys (fzf mode): type=filter · enter=pick (copies path) · tab=show/hide transcript pane
 #                  ctrl-f=search inside transcripts (--content on what you typed)
 #                  ctrl-a=switch agent · ctrl-e=export markdown · ctrl-y=copy path · ctrl-r=refresh
 set -u
 
-VERSION="1.10.0"
+VERSION="1.11.0"
 SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || echo "$0")"
 
 command -v python3 >/dev/null 2>&1 || { echo "transcripts: python3 required (macOS: xcode-select --install)"; exit 1; }
@@ -64,10 +91,10 @@ _clip() {
 }
 
 # ---------------------------------------------------------------- python core
-run_py() { # run_py CMD ARG1 ARG2 ARG3 ARG4 ARG5
+run_py() { # run_py CMD ARG1..ARG6
   TR_CMD="${1:-}" TR_ARG1="${2:-}" TR_ARG2="${3:-}" TR_ARG3="${4:-}" TR_ARG4="${5:-}" \
-  TR_ARG5="${6:-}" python3 - <<'PYCODE'
-import os, sys, re, json, glob, time, sqlite3, tempfile, shutil, signal
+  TR_ARG5="${6:-}" TR_ARG6="${7:-}" python3 - <<'PYCODE'
+import os, sys, re, json, glob, time, sqlite3, tempfile, shutil, signal, unicodedata, atexit
 
 try: signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 except Exception: pass
@@ -78,29 +105,86 @@ ARG2 = os.environ.get("TR_ARG2", "")
 ARG3 = os.environ.get("TR_ARG3", "")
 ARG4 = os.environ.get("TR_ARG4", "")
 ARG5 = os.environ.get("TR_ARG5", "")
+ARG6 = os.environ.get("TR_ARG6", "")
 
 def since_seconds(spec):
     """'10d'/'5h'/'30m' -> seconds; ''/'all' -> None; invalid -> exit 1."""
     s = (spec or "").strip().lower()
     if s in ("", "all", "full"): return None
-    m = re.fullmatch(r"(\d+)([dhm])", s)
+    m = re.fullmatch(r"(\d+)\s*([dhmw])", s)
     if not m:
-        sys.stderr.write(f"transcripts: invalid --since '{spec}' — use Nd, Nh or Nm (e.g. 10d, 5h, 30m)\n")
+        sys.stderr.write(f"transcripts: invalid --since '{spec}' — use Nm, Nh, Nd or Nw "
+                         f"(e.g. 30m, 5h, 10d, 2w), or 'all'\n")
         sys.exit(1)
-    return int(m.group(1)) * {"d": 86400, "h": 3600, "m": 60}[m.group(2)]
+    return int(m.group(1)) * {"d": 86400, "h": 3600, "m": 60, "w": 604800}[m.group(2)]
 
 HOME = os.environ.get("TRANSCRIPTS_HOME") or os.path.expanduser("~")
 CACHE_DIR = os.path.join(HOME, ".cache", "transcripts-tui")
-CACHE_FILE = os.path.join(CACHE_DIR, "index-v5.json")
-for _old in ("index-v1.json", "index-v2.json", "index-v3.json", "index-v4.json"):
+CACHE_FILE = os.path.join(CACHE_DIR, "index-v6.json")
+for _old in ("index-v1.json", "index-v2.json", "index-v3.json", "index-v4.json", "index-v5.json"):
     try: os.remove(os.path.join(CACHE_DIR, _old))
     except OSError: pass
 
-try: SCAN_CAP = max(1, int(os.environ.get("TRANSCRIPTS_SCAN") or 300))
-except ValueError: SCAN_CAP = 300
+try: KV_CAP = max(100, int(os.environ.get("TRANSCRIPTS_KV_CAP") or 4000))
+except ValueError: KV_CAP = 4000
 
-R  = "\x1b[0m";  DIM = "\x1b[2m";  BOLD = "\x1b[1m"
-CY = "\x1b[36m"; MG = "\x1b[35m"; GR = "\x1b[32m"; YL = "\x1b[33m"; BL = "\x1b[34m"
+try: SCAN_CAP = max(1, int(os.environ.get("TRANSCRIPTS_SCAN") or 300))
+except ValueError:
+    sys.stderr.write(f"transcripts: --scan must be a number, got "
+                     f"{os.environ.get('TRANSCRIPTS_SCAN')!r}\n")
+    sys.exit(1)
+
+# Colour goes to terminals, not to pipes. `index`/`legend` are always consumed by fzf --ansi.
+# NO_COLOR (https://no-color.org) wins; FORCE_COLOR/CLICOLOR_FORCE force it back on.
+def _use_color():
+    if os.environ.get("NO_COLOR"): return False
+    if os.environ.get("FORCE_COLOR") or os.environ.get("CLICOLOR_FORCE"): return True
+    if CMD in ("index", "legend"): return True
+    try: return sys.stdout.isatty()
+    except Exception: return False
+
+COLOR = _use_color()
+def _c(seq): return seq if COLOR else ""
+
+R  = _c("\x1b[0m");  DIM = _c("\x1b[2m");  BOLD = _c("\x1b[1m")
+CY = _c("\x1b[36m"); MG = _c("\x1b[35m"); GR = _c("\x1b[32m")
+YL = _c("\x1b[33m"); BL = _c("\x1b[34m")
+
+# ------------------------------------------------------------- display width
+# Emoji and CJK occupy two terminal columns but one Python character. Padding by len()
+# misaligns every column to the right of a title containing one — and AI chat titles are
+# full of emoji.
+def dwidth(s):
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch): continue
+        o = ord(ch)
+        if unicodedata.east_asian_width(ch) in ("W", "F") or 0x1F300 <= o <= 0x1FAFF \
+           or 0x2600 <= o <= 0x27BF:
+            w += 2
+        elif o >= 32 or ch == "\t":
+            w += 1
+    return w
+
+def clip_w(s, n):
+    """Truncate to n display columns, ellipsis included."""
+    if n <= 0: return ""
+    if dwidth(s) <= n: return s
+    out, w = [], 0
+    for ch in s:
+        cw = dwidth(ch)
+        if w + cw > n - 1: break
+        out.append(ch); w += cw
+    return "".join(out) + "…"
+
+def pad_w(s, n):
+    """Left-align s in n display columns (truncating if needed)."""
+    s = clip_w(s, n)
+    return s + " " * max(0, n - dwidth(s))
+
+def rpad_w(s, n):
+    s = clip_w(s, n)
+    return " " * max(0, n - dwidth(s)) + s
 
 def clean(s, n=0):
     s = re.sub(r"\s+", " ", (s or "")).strip()
@@ -146,13 +230,16 @@ def row_hay(r):
     return " ".join((r["n"], r["l"], r.get("z") or "", r["j"], r["i"],
                      f'{r["a"]}·{r["s"]}', r["r"] or ""))
 
-HL = "\x1b[30;43m"      # black on yellow — legible on light and dark terminals alike
+HL = _c("\x1b[30;43m")  # black on yellow — legible on light and dark terminals alike
 
 def hl_re(terms):
     return re.compile("|".join(re.escape(t) for t in terms), re.I) if terms else None
 
-def hl(t, rx):
-    return rx.sub(lambda m: f"{HL}{m.group(0)}{R}", t) if rx else t
+def hl(t, rx, restore=""):
+    """restore = the style in effect around t; the reset that ends a highlight would
+    otherwise strip bold/colour from everything after the first match."""
+    if not rx: return t
+    return rx.sub(lambda m: f"{HL}{m.group(0)}{R}{restore}", t)
 
 def snip(t, terms, n=700):
     """Window of t around its FIRST matching term. A match 4k chars into a message is
@@ -167,12 +254,17 @@ def snip(t, terms, n=700):
 
 def body_text(r):
     """Full conversation text for a row. Only called under --content: this opens the
-    transcript (jsonl read / sqlite query), so it is orders of magnitude slower than row_hay."""
+    transcript (jsonl read / sqlite query), so it is orders of magnitude slower than row_hay.
+    Reads the WHOLE session — a search that quietly skipped the first half of a long
+    conversation would be worse than no search at all."""
     try:
-        _typ, _path, _rid, msgs, title = get_messages(r["f"], 2000)
+        typ = r["f"].split("|", 1)[0]
+        if typ == "cc":
+            return " ".join(m[1] for m in cc_messages(r["p"], 10 ** 9, whole=True))
+        _typ, _path, _rid, msgs, title = get_messages(r["f"], 10 ** 9)
+        return (title or "") + " " + " ".join(m[1] for m in msgs)
     except Exception:
         return ""
-    return (title or "") + " " + " ".join(m[1] for m in msgs)
 
 def jload(b):
     try: return json.loads(b)
@@ -191,6 +283,13 @@ def rel(ts):
 def fmt_ts(ts):
     try: return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
     except Exception: return "?"
+
+def iso_ts(ts):
+    """ISO 8601 with offset — unambiguous for anything consuming --json."""
+    try:
+        from datetime import datetime
+        return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+    except Exception: return ""
 
 # ------------------------------------------------------------- cache
 _cache = None
@@ -220,31 +319,123 @@ def cache_save():
         os.replace(tmp, CACHE_FILE)
     except Exception: pass
 
-def mkrow(agent, src, sid, name, role, last, ts, path, ref, proj):
+def mkrow(agent, src, sid, name, role, last, ts, path, ref, proj, cwd=""):
+    # "d" is the directory the session ran in (Claude's cwd / Cursor's workspace folder).
+    # It is what --dir filters on; "j" is only its display label.
     return {"a": agent, "s": src, "i": sid, "n": clean(name, 200), "r": role,
             "l": clean(last, 300), "z": tailof(last, 300),
-            "t": float(ts or 0), "p": path, "f": ref, "j": clean(proj, 60)}
+            "t": float(ts or 0), "p": path, "f": ref, "j": clean(proj, 60),
+            "d": norm_dir(cwd)}
+
+# ------------------------------------------------------------- directory scoping
+def norm_dir(p):
+    """Absolute, symlink-resolved, no trailing slash. '' when unknown."""
+    p = (p or "").strip()
+    if not p: return ""
+    p = re.sub(r"^file://", "", p)
+    p = os.path.expanduser(p)
+    try: p = os.path.realpath(os.path.abspath(p))
+    except Exception: p = os.path.abspath(p)
+    return p.rstrip("/") or "/"
+
+def slugify_dir(p):
+    """Claude names its project dirs after the cwd with every '/' and '.' turned into '-'
+    (Cursor does the same, minus the leading dash). The encoding is lossy — a literal '-' in a
+    directory name is indistinguishable from a separator — so this is only ever a fallback."""
+    return re.sub(r"[/.]", "-", p)
+
+_UNSLUG = {}
+def unslug_dir(slug):
+    """Best-effort inverse of the slug encoding, disambiguated against the filesystem: walk
+    segment by segment taking the longest join that names a real directory, so 'omni-360' and
+    'ohmaseclaro-lahzo' both resolve correctly. '' when it can't be resolved."""
+    if slug in _UNSLUG: return _UNSLUG[slug]
+    parts = [p for p in slug.split("-") if p]
+    cur, i = "/", 0
+    while i < len(parts):
+        for j in range(len(parts), i, -1):                  # longest candidate first
+            seg = "-".join(parts[i:j])
+            for cand in (os.path.join(cur, seg), os.path.join(cur, "." + seg)):
+                if os.path.isdir(cand):
+                    cur, i = cand, j
+                    break
+            else:
+                continue
+            break
+        else:
+            cur = ""; break
+    _UNSLUG[slug] = cur if cur != "/" else ""
+    return _UNSLUG[slug]
+
+def under_dir(row, target):
+    """True when the session ran in target or anywhere below it.
+
+    Preferred signal is the recorded working directory. Falling back to the slugged directory
+    name in the store path catches sessions whose project directory has since been deleted or
+    renamed — unslug_dir() can't resolve those because the path no longer exists on disk."""
+    if not target: return True
+    d = row.get("d") or ""
+    if d:
+        return d == target or d.startswith(target + "/")
+    s = slugify_dir(target).strip("-")
+    if not s: return False
+    for seg in (row.get("p") or "").split("/"):
+        seg = seg.strip("-")
+        if seg == s or seg.startswith(s + "-"): return True
+    return False
 
 # ------------------------------------------------------------- sqlite helper
+# Opening a Cursor db can mean copying it (when Cursor holds the lock), and the global
+# state.vscdb is measured in gigabytes. --content walks hundreds of rows that all live in the
+# same handful of databases, so connections are pooled for the life of the process. close() on
+# a handed-out handle is a no-op; the pool owns teardown. The pool is small because macOS
+# defaults to a 256-descriptor limit and there can be thousands of store.db files.
+_DBPOOL = {}          # path -> (connection, tempdir or None)
+_DBPOOL_MAX = 8
+
+class _Pooled:
+    """Connection handle whose close() is a no-op — the pool closes the real one."""
+    __slots__ = ("_con",)
+    def __init__(self, con): self._con = con
+    def execute(self, *a, **k): return self._con.execute(*a, **k)
+    def close(self): pass
+
+def _dbpool_drop(path):
+    con, td = _DBPOOL.pop(path, (None, None))
+    if con is not None:
+        try: con.close()
+        except Exception: pass
+    if td: shutil.rmtree(td, ignore_errors=True)
+
+@atexit.register
+def _dbpool_clear():
+    for p in list(_DBPOOL): _dbpool_drop(p)
+
 def db_ro(path):
+    if path in _DBPOOL:
+        return _Pooled(_DBPOOL[path][0]), None
+    con = td = None
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.8)
         con.execute("select 1 from sqlite_master limit 1").fetchone()
-        return con, None
     except Exception:
-        pass
-    try:
-        if os.path.getsize(path) > 2_000_000_000:
-            raise Exception("db locked and too large to copy")
-    except OSError: pass
-    td = tempfile.mkdtemp(prefix="trx-")
-    for ext in ("", "-wal", "-shm"):
-        s = path + ext
-        if os.path.exists(s):
-            try: shutil.copy2(s, os.path.join(td, "db" + ext))
-            except Exception: pass
-    con = sqlite3.connect(f"file:{os.path.join(td,'db')}?mode=ro", uri=True)
-    return con, td
+        con = None
+    if con is None:
+        try:
+            if os.path.getsize(path) > 2_000_000_000:
+                raise Exception("db locked and too large to copy")
+        except OSError: pass
+        td = tempfile.mkdtemp(prefix="trx-")
+        for ext in ("", "-wal", "-shm"):
+            s = path + ext
+            if os.path.exists(s):
+                try: shutil.copy2(s, os.path.join(td, "db" + ext))
+                except Exception: pass
+        con = sqlite3.connect(f"file:{os.path.join(td,'db')}?mode=ro", uri=True)
+    while len(_DBPOOL) >= _DBPOOL_MAX:
+        _dbpool_drop(next(iter(_DBPOOL)))
+    _DBPOOL[path] = (con, td)
+    return _Pooled(con), None
 
 # ------------------------------------------------------------- claude jsonl
 CC_SKIP = ("<command-name>", "<command-message>", "<local-command", "Caveat: The messages below",
@@ -415,7 +606,7 @@ def parse_cc(f, st):
         proj = os.path.basename(cwd) if cwd else (slug.rsplit("-", 1)[-1] or slug)
         src = "code"
     row = mkrow("claude", src, sid, name or first or "(untitled)", role, last or "",
-                st.st_mtime, f, f"cc|{f}|{sid}", proj)
+                st.st_mtime, f, f"cc|{f}|{sid}", proj, cwd or unslug_dir(slug))
     return {"r": row, "x": aux}
 
 def _title_walk(d, out, depth=0):
@@ -681,7 +872,7 @@ def parse_store(db, st):
         ts = (meta.get("updatedAtMs") or 0) / 1000.0 or st.st_mtime
         proj = os.path.basename((meta.get("cwd") or "").rstrip("/"))
         return mkrow("cursor", "sub" if sub else "cli", sid, name or first or "(untitled)",
-                     role, last or "", ts, db, f"cs|{db}|{sid}", proj)
+                     role, last or "", ts, db, f"cs|{db}|{sid}", proj, meta.get("cwd") or "")
     finally:
         con.close()
         if td: shutil.rmtree(td, ignore_errors=True)
@@ -724,9 +915,11 @@ def parse_cagent(f, st):
             break
     if not (first or last): return None
     sid = os.path.splitext(os.path.basename(f))[0].replace("agent-", "")
-    proj = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(f))))[-24:]
+    slug = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(f))))
+    cwd = unslug_dir(slug)
+    proj = os.path.basename(cwd) if cwd else slug[-24:]
     return mkrow("cursor", "sub", sid, first or "(agent run)", role, last or "",
-                 st.st_mtime, f, f"cj|{f}|{sid}", proj)
+                 st.st_mtime, f, f"cj|{f}|{sid}", proj, cwd)
 
 def scan_cursor_agents(rows, errors):
     fs = []
@@ -789,10 +982,9 @@ def comp_ts(d, m):
             ts = max(ts, cursor_ts(src_.get(k)))
     return ts
 
-def comp_proj(d, wfold, cid):
-    """Project label: workspace folder if known, else common dir of originalFileStates."""
-    p = wfold.get(cid) or ""
-    if p: return os.path.basename(p.rstrip("/"))
+def comp_dir(d):
+    """Directory a composer worked in, inferred from the files it touched. Used when the
+    composer isn't tied to a workspace folder — without it those rows can't be --dir filtered."""
     states = d.get("originalFileStates")
     paths = []
     if isinstance(states, dict): paths = [k for k in states.keys() if isinstance(k, str)]
@@ -802,21 +994,28 @@ def comp_proj(d, wfold, cid):
             elif isinstance(s_, dict):
                 for k in ("uri", "path", "fsPath", "relativePath"):
                     if isinstance(s_.get(k), str): paths.append(s_[k]); break
-    paths = [re.sub(r"^file://", "", p_) for p_ in paths]
+    paths = [re.sub(r"^file://", "", p_) for p_ in paths if p_.startswith(("/", "file://"))]
     if not paths: return ""
-    try: pref = os.path.commonpath(paths) if len(paths) > 1 else os.path.dirname(paths[0])
+    try: return os.path.commonpath(paths) if len(paths) > 1 else os.path.dirname(paths[0])
     except Exception: return ""
-    segs = [s for s in pref.split("/") if s]
+
+def comp_proj(d, wfold, cid):
+    """Project label: workspace folder if known, else common dir of originalFileStates."""
+    p = wfold.get(cid) or ""
+    if p: return os.path.basename(p.rstrip("/"))
+    segs = [s for s in comp_dir(d).split("/") if s]
     return "/".join(segs[-2:]) if len(segs) >= 2 else (segs[-1] if segs else "")
 
 def scan_kv_composers(con, dbpath, wmeta, wfold, rows, include_sub, errors, extra_ids=()):
     """Enumerate ALL composer transcripts inside a state.vscdb's cursorDiskKV.
     Indexed range scan, newest rowid first (composer updates re-insert with higher rowid)."""
     comp = {}
+    seen = 0
     try:
         for k, v in con.execute(
                 "select key, value from cursorDiskKV where key >= 'composerData:' "
-                "and key < 'composerData;' order by rowid desc limit 1000"):
+                f"and key < 'composerData;' order by rowid desc limit {KV_CAP + 1}"):
+            seen += 1
             if isinstance(k, (bytes, bytearray)): k = k.decode("utf-8", "replace")
             cid = k.split(":", 1)[1]
             if cid in comp: continue
@@ -825,6 +1024,9 @@ def scan_kv_composers(con, dbpath, wmeta, wfold, rows, include_sub, errors, extr
     except Exception as e:
         errors.append(f"{dbpath} cursorDiskKV: {e}")
         comp = {}
+    if seen > KV_CAP:      # older chats exist but weren't read — say so instead of hiding them
+        errors.append(f"{dbpath}: more than {KV_CAP} composer records; only the newest were "
+                      f"indexed (raise TRANSCRIPTS_KV_CAP)")
     def bubble_get(cid, bid):
         try:
             r = con.execute("select value from cursorDiskKV where key=?",
@@ -839,6 +1041,9 @@ def scan_kv_composers(con, dbpath, wmeta, wfold, rows, include_sub, errors, extr
         name = m.get("name") or d.get("name") or ""
         if name == "New Agent": name = ""
         ts = comp_ts(d, m)
+        if not ts:
+            try: ts = os.path.getmtime(dbpath)
+            except OSError: ts = 0
         first = last = ""; role = ""
         conv = d.get("conversation") or []
         if conv:
@@ -866,7 +1071,8 @@ def scan_kv_composers(con, dbpath, wmeta, wfold, rows, include_sub, errors, extr
         if not (name or first or last or subtitle): continue
         rows.append(mkrow("cursor", "sub" if sub else "app", cid,
                           name or first or subtitle or "(untitled)", role, last, ts, dbpath,
-                          f"ca|{dbpath}|{cid}", comp_proj(d, wfold, cid)))
+                          f"ca|{dbpath}|{cid}", comp_proj(d, wfold, cid),
+                          wfold.get(cid) or comp_dir(d)))
 
 def cursor_user_dirs():
     dirs = []
@@ -926,7 +1132,7 @@ def scan_cursor_app(rows, errors, include_sub):
                             rows.append(mkrow("cursor", "app", tid or "tab",
                                               tab.get("chatTitle") or first or "(chat)",
                                               role, last, ts, wdb, f"cl|{wdb}|{tid}",
-                                              os.path.basename(folder.rstrip("/"))))
+                                              os.path.basename(folder.rstrip("/")), folder))
                 except Exception: pass
                 # some Cursor versions keep composer transcripts per-workspace too
                 try:
@@ -973,8 +1179,8 @@ def collect(agent, include_sub):
     rows = sorted(best.values(), key=lambda r: -r["t"])
     return rows, errors
 
-def emit_index(agent, query, include_sub, content=False):
-    sel, _ = _filter_rows(agent, query, include_sub, "all", content)
+def emit_index(agent, query, include_sub, content=False, dirspec=""):
+    sel, _ = _filter_rows(agent, query, include_sub, "all", content, dirspec)
     out = []
     for r in sel:
         z = r.get("z") or ""
@@ -984,12 +1190,13 @@ def emit_index(agent, query, include_sub, content=False):
         who = "you" if r["r"] == "user" else (r["r"] or "-")
         lm = clean(r["l"], 110)
         zt = tail_disp(r["l"], z, 110, 110)
-        vis = len(lm) + (3 + len(zt) if zt else 0)
+        vis = dwidth(lm) + (3 + dwidth(zt) if zt else 0)
         if zt: lm += f' {DIM}⋯{R} {zt}'
         lm += " " * max(0, 110 - vis)      # fixed width: keeps field 3 past the right edge
-        disp = (f'{DIM}{rel(r["t"]):>4}{R} {col}{tag:<11}{R} {DIM}{r["i"][:8]:<8}{R} '
-                f'{BOLD}{clean(r["n"], 44):<44}{R} {GR}{clean(r["j"], 16):<16}{R} '
-                f'{rolec}{who:>6}:{R} {lm}')
+        disp = (f'{DIM}{rpad_w(rel(r["t"]), 4)}{R} {col}{pad_w(tag, 11)}{R} '
+                f'{DIM}{pad_w(r["i"][:8], 8)}{R} '
+                f'{BOLD}{pad_w(clean(r["n"]), 44)}{R} {GR}{pad_w(clean(r["j"]), 16)}{R} '
+                f'{rolec}{rpad_w(who, 6)}:{R} {lm}')
         # Field 3 is the full cached text. fzf matches fields 2.. but renders from the left with
         # --no-hscroll, and the padding above puts field 3 ~205 columns in — so typing in the TUI
         # searches everything the cache knows while only the columns stay on screen.
@@ -998,13 +1205,20 @@ def emit_index(agent, query, include_sub, content=False):
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 # ------------------------------------------------------------- details / export
-def cc_messages(f, limit):
+BODY_MAX = 64 * 1024 * 1024
+
+def cc_messages(f, limit, whole=False):
+    """whole=True reads the entire session. The default tail-only read is fine for showing the
+    last N messages, but searching it would silently miss everything before the last 2 MB."""
     msgs = []
     try:
         with open(f, "rb") as fh:
-            fh.seek(0, 2); size = fh.tell()
-            fh.seek(max(0, size - 2_000_000))
-            lines = fh.read().split(b"\n")
+            if whole:
+                lines = fh.read(BODY_MAX).split(b"\n")
+            else:
+                fh.seek(0, 2); size = fh.tell()
+                fh.seek(max(0, size - 2_000_000))
+                lines = fh.read().split(b"\n")
     except OSError:
         return msgs
     for b in lines:
@@ -1044,10 +1258,18 @@ def composer_messages(gdb, cid, limit):
                 if t: msgs.append(("user" if b.get("type") == 1 else "cursor", t, ""))
         else:
             hdrs = (d.get("fullConversationHeadersOnly") or [])[-limit:]
+            # One indexed range scan instead of a query per bubble: --content over a few
+            # hundred composers turned this into six figures of round-trips.
+            bubs = {}
+            try:
+                for k, v in con.execute(
+                        "select key, value from cursorDiskKV where key >= ? and key < ?",
+                        (f"bubbleId:{cid}:", f"bubbleId:{cid};")):
+                    if isinstance(k, (bytes, bytearray)): k = k.decode("utf-8", "replace")
+                    bubs[k.rsplit(":", 1)[-1]] = v
+            except Exception: pass
             for h in hdrs:
-                r2 = con.execute("select value from cursorDiskKV where key=?",
-                                 (f"bubbleId:{cid}:{h.get('bubbleId')}",)).fetchone()
-                b = jload(r2[0]) if r2 else None
+                b = jload(bubs.get(h.get("bubbleId")))
                 t = bub_text(b) if b else ""
                 if t: msgs.append(("user" if h.get("type") == 1 else "cursor", t, ""))
         return msgs[-limit:], (d.get("name") or "")
@@ -1113,7 +1335,36 @@ def cc_own_title(path):
         elif t == "summary" and d.get("summary") and not summ: summ = d["summary"]
     return cu or ai or summ
 
-def do_details(ref, query=""):
+def do_details_json(ref, query=""):
+    """Structured transcript for non-human consumers: no ANSI, no truncation of message text,
+    chronological order, and an explicit flag on which messages matched the query."""
+    terms = qterms(query)
+    LIM = 2000
+    try:
+        typ, path, rid, msgs, title = get_messages(ref, LIM)
+    except Exception as e:
+        json.dump({"ref": ref, "error": str(e)}, sys.stdout); print()
+        sys.exit(1)
+    if typ == "cc" and not title: title = cc_own_title(path)
+    try: mt = os.path.getmtime(path)
+    except OSError: mt = 0
+    out = {
+        "ref": ref, "type": typ, "path": path, "id": rid, "title": title or "",
+        "updated": fmt_ts(mt), "updated_iso": iso_ts(mt),
+        "query": query, "message_count": len(msgs),
+        "truncated": len(msgs) >= LIM,          # older messages exist beyond this window
+        "order": "chronological",
+        "messages": [{"role": r_, "text": t, "ts": ts,
+                      "matched": bool(terms) and any(x in t.lower() for x in terms)}
+                     for r_, t, ts in msgs],
+    }
+    out["match_count"] = sum(1 for m in out["messages"] if m["matched"])
+    json.dump(out, sys.stdout, ensure_ascii=False)
+    print()
+
+def do_details(ref, query="", mode=""):
+    if mode == "json":
+        return do_details_json(ref, query)
     terms = qterms(query)
     # With a query, look deeper than the last 14 messages — a --content hit is usually
     # mid-conversation, and a preview that can't show why it matched is useless.
@@ -1127,7 +1378,7 @@ def do_details(ref, query=""):
     try: mt = fmt_ts(os.path.getmtime(path))
     except OSError: mt = "?"
     rx = hl_re(terms)
-    print(f"{BOLD}{GR}● {hl(title or names.get(typ, typ), rx)}{R}")
+    print(f"{BOLD}{GR}● {hl(title or names.get(typ, typ), rx, BOLD + GR)}{R}")
     sub = (f"{names.get(typ, typ)} · " if title else "") + f"updated {mt}"
     print(f"{DIM}   {sub}{R}")
     print(f"{DIM}   id     {R}{rid}")
@@ -1168,18 +1419,30 @@ def do_details(ref, query=""):
         print(f"{DIM}{'─' * 34} latest message first ▼{R}")
     show([i for i in range(min(14, len(msgs))) if i not in lead])
 
-def do_export(ref):
-    typ, path, rid, msgs, title = get_messages(ref, 400)
-    dl = os.path.join(HOME, "Downloads")
-    if not os.path.isdir(dl): dl = tempfile.gettempdir()
+def do_export(ref, dest=""):
+    LIM = 2000
+    typ, path, rid, msgs, title = get_messages(ref, LIM)
+    if typ == "cc" and not title: title = cc_own_title(path)
     if not title and msgs:
         title = next((t for r_, t, _ in msgs if r_ == "user"), msgs[0][1])[:60]
-    slug = re.sub(r"[^A-Za-z0-9]+", "-", (title or "transcript"))[:40].strip("-") or "transcript"
-    out = os.path.join(dl, f"transcript-{typ}-{rid[:8]}-{slug}.md")
-    with open(out, "w") as f:
-        f.write(f"# {title or 'Transcript'}\n\n- source: `{path}`\n- id: `{rid}`\n\n---\n\n")
+    def write(f):
+        f.write(f"# {title or 'Transcript'}\n\n- source: `{path}`\n- id: `{rid}`\n"
+                f"- messages: {len(msgs)}{' (older ones truncated)' if len(msgs) >= LIM else ''}\n"
+                f"\n---\n\n")
         for role, t, ts in msgs:
             f.write(f"### {role}{(' — ' + ts) if ts else ''}\n\n{t.strip()}\n\n---\n\n")
+    if dest == "-":                       # straight to stdout: no temp file for callers to clean up
+        write(sys.stdout); return
+    if dest:
+        out = os.path.abspath(os.path.expanduser(dest))
+        if os.path.isdir(out):
+            out = os.path.join(out, f"transcript-{typ}-{rid[:8]}.md")
+    else:
+        dl = os.path.join(HOME, "Downloads")
+        if not os.path.isdir(dl): dl = tempfile.gettempdir()
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", (title or "transcript"))[:40].strip("-") or "transcript"
+        out = os.path.join(dl, f"transcript-{typ}-{rid[:8]}-{slug}.md")
+    with open(out, "w") as f: write(f)
     print(out)
 
 def do_doctor(include_sub):
@@ -1203,6 +1466,12 @@ def do_doctor(include_sub):
           ", ".join(f"{k}={v}" for k, v in sorted(c.items())))
     if any(TITLE_STATS.values()):
         print("  claude titles: " + ", ".join(f"{k}={v}" for k, v in TITLE_STATS.items() if v))
+    withdir = sum(1 for r in rows if r.get("d"))
+    print(f"  directory known for {withdir}/{len(rows)} "
+          f"({'--dir can only match those' if withdir < len(rows) else 'all --dir filterable'})")
+    if withdir < len(rows):
+        miss = Counter(f'{r["a"]}·{r["s"]}' for r in rows if not r.get("d"))
+        print("    missing a dir: " + ", ".join(f"{k}={v}" for k, v in sorted(miss.items())))
     homes = _user_homes()
     print(f"  account homes scanned: {', '.join(homes)}")
     if DEDUPED: print(f"  deduped {DEDUPED} synced duplicates (same id, kept newest)")
@@ -1217,18 +1486,26 @@ def do_doctor(include_sub):
         for e in errors[:10]: print(f"    ! {e}")
     print(f"  cache: {CACHE_FILE}")
 
-def _filter_rows(agent, query, include_sub, since_spec, content=False):
-    """The single filter. Metadata match is free (cached); --content additionally opens the
-    newest SCAN_CAP non-matching transcripts and searches the conversation itself."""
+def warn(msg):
+    """Diagnostics go to stderr — except under `index`, whose output feeds an fzf reload and
+    whose stderr would be painted over the live TUI."""
+    if CMD != "index": sys.stderr.write(msg)
+
+def _filter_rows(agent, query, include_sub, since_spec, content=False, dirspec=""):
+    """The single filter, in cost order: time window, then directory scope, then the cached
+    metadata query, and only then --content (which opens transcripts off disk)."""
     secs = since_seconds(since_spec)
     cutoff = (time.time() - secs) if secs is not None else None
-    rows, _ = collect(agent, include_sub)
+    target = norm_dir(dirspec) if dirspec else ""
+    rows, errors = collect(agent, include_sub)
     terms = qterms(query)
     sel = []
     scanned = skipped = 0
     for r in rows:
         if cutoff is not None and r["t"] < cutoff:
             break        # rows are sorted newest-first
+        if target and not under_dir(r, target):
+            continue
         if not terms or qmatch(terms, row_hay(r)):
             sel.append(r)
             continue
@@ -1241,94 +1518,133 @@ def _filter_rows(agent, query, include_sub, since_spec, content=False):
         if qmatch(terms, body_text(r)):
             sel.append(r)
     if skipped:
-        sys.stderr.write(
-            f"transcripts: --content read the {scanned} newest transcripts; {skipped} older ones "
-            f"were NOT searched. Narrow with --since/--agent, or raise --scan (default {SCAN_CAP}).\n")
+        warn(f"transcripts: --content read the {scanned} newest transcripts; {skipped} older ones "
+             f"were NOT searched. Narrow with --since/--agent/--dir, or raise --scan "
+             f"(default {SCAN_CAP}).\n")
+    if errors:
+        warn(f"transcripts: {len(errors)} store(s) could not be read "
+             f"(--doctor lists them); results may be incomplete.\n")
     return sel, secs
 
 def _pad(s, w):
-    s = clean(s, w)
-    return s + " " * (w - len(s))
+    return pad_w(clean(s), w)
 
 def _pad_end(s, w):
-    s = clean_end(s, w)
-    return s + " " * (w - len(s))
+    s = clean(s)
+    if dwidth(s) > w: s = "…" + clip_w_end(s, w - 1)
+    return s + " " * max(0, w - dwidth(s))
 
-def emit_table(agent, query, include_sub, since_spec, content=False):
-    sel, secs = _filter_rows(agent, query, include_sub, since_spec, content)
+def clip_w_end(s, n):
+    """Keep the LAST n display columns of s."""
+    if n <= 0: return ""
+    out, w = [], 0
+    for ch in reversed(s):
+        cw = dwidth(ch)
+        if w + cw > n: break
+        out.append(ch); w += cw
+    return "".join(reversed(out))
+
+def emit_table(agent, query, include_sub, since_spec, content=False, dirspec=""):
+    sel, secs = _filter_rows(agent, query, include_sub, since_spec, content, dirspec)
     try: width = os.get_terminal_size(sys.__stdout__.fileno()).columns
     except Exception:
         try: width = int(os.environ.get("COLUMNS") or 120)
         except ValueError: width = 120
-    width = max(width, 110)
     IDW, SRW, UPW = 8, 11, 12
-    flex = width - 19 - (IDW + SRW + UPW)
-    TW = max(20, int(flex * 0.30))
-    HW = max(18, int(flex * 0.36))
-    ZW = max(18, flex - TW - HW)
-    widths = [IDW, SRW, UPW, TW, HW, ZW]
-    W = sum(widths) + 19
-    w_desc = "all time" if secs is None else f"last {since_spec.strip().lower()}"
+    # Narrow terminals used to get a 110-column table that wrapped into unreadable garbage.
+    # Drop the tail column first, then the id, rather than overflowing.
+    cols = ["ID", "SOURCE", "UPDATED", "TITLE", "LAST MESSAGE HEAD", "LAST MESSAGE TAIL"]
+    show_tail = width >= 100
+    show_id = width >= 76
+    if not show_tail: cols.remove("LAST MESSAGE TAIL")
+    if not show_id: cols.remove("ID")
+    nsep = 3 * len(cols) + 1
+    fixed = (IDW if show_id else 0) + SRW + UPW
+    flex = max(30, width - nsep - fixed)
+    if show_tail:
+        TW = max(16, int(flex * 0.30)); HW = max(14, int(flex * 0.36)); ZW = max(14, flex - TW - HW)
+    else:
+        TW = max(16, int(flex * 0.42)); HW = max(14, flex - TW); ZW = 0
+    widths = ([IDW] if show_id else []) + [SRW, UPW, TW, HW] + ([ZW] if show_tail else [])
+    W = sum(widths) + nsep
+    w_desc = "all time" if secs is None else f"last {(since_spec or '').strip().lower()}"
     def hline(lft, mid, rgt):
         return DIM + lft + mid.join("─" * (w + 2) for w in widths) + rgt + R
     sep = DIM + "│" + R
+    scope = f" · dir: {norm_dir(dirspec)}" if dirspec else ""
     out = [f"{DIM}transcripts · agent={agent} · {w_desc} · {len(sel)} shown"
-           f"{(' · filter: ' + query) if query else ''} · full paths: --tsv or pipe{R}",
+           f"{(' · filter: ' + query) if query else ''}{scope}"
+           f"{' · content' if content else ''} · full paths: --tsv or pipe{R}",
            hline("┌", "┬", "┐"),
-           sep + sep.join(f" {BOLD}{_pad(h, w)}{R} " for h, w in
-                          zip(["ID", "SOURCE", "UPDATED", "TITLE",
-                               "LAST MESSAGE HEAD", "LAST MESSAGE TAIL"], widths)) + sep,
+           sep + sep.join(f" {BOLD}{_pad(h, w)}{R} " for h, w in zip(cols, widths)) + sep,
            hline("├", "┼", "┤")]
     home = os.path.expanduser("~")
     for r in sel:
         tag = f'{r["a"]}·{r["s"]}'
         pfx = ("you" if r["r"] == "user" else r["r"]) + ": " if r["r"] else ""
-        cells = [DIM + _pad(r["i"][:8], IDW) + R,
+        cells = ([DIM + _pad(r["i"][:8], IDW) + R] if show_id else []) + [
                  (TAGC.get(tag, "")) + _pad(tag, SRW) + R,
                  _pad(time.strftime("%d %b %H:%M", time.localtime(r["t"])), UPW),
                  BOLD + _pad(r["n"], TW) + R,
-                 _pad(pfx + r["l"], HW),
-                 _pad_end(tail_disp(r["l"], r.get("z") or "", HW - len(pfx), ZW), ZW)]
+                 _pad(pfx + r["l"], HW)]
+        if show_tail:
+            cells.append(_pad_end(tail_disp(r["l"], r.get("z") or "", max(1, HW - len(pfx)), ZW), ZW))
         out.append(sep + sep.join(f" {c} " for c in cells) + sep)
         p = r["p"]
         if p.startswith(home): p = "~" + p[len(home):]
         pw = W - 6
-        if len(p) > pw: p = "…" + p[-(pw - 1):]
-        out.append(DIM + "│ ⤷ " + p + " " * (pw - len(p)) + " │" + R)
+        if dwidth(p) > pw: p = "…" + clip_w_end(p, pw - 1)
+        out.append(DIM + "│ ⤷ " + p + " " * max(0, pw - dwidth(p)) + " │" + R)
     out.append(hline("└", "┴", "┘"))
     if not sel:
-        out.append("nothing in this window — try --since=7d or --full-list")
+        out.append(no_match_hint(query, since_spec, content, dirspec))
     print("\n".join(out))
 
-def emit_plain(agent, query, include_sub, as_json, since_spec, content=False):
-    sel, _secs = _filter_rows(agent, query, include_sub, since_spec, content)
+def no_match_hint(query, since_spec, content, dirspec):
+    """Say which filter is the likely culprit instead of always blaming the time window."""
+    bits = []
+    if dirspec: bits.append(f"--dir {norm_dir(dirspec)}")
+    if query: bits.append(f'query "{query}"')
+    if since_seconds(since_spec) is not None: bits.append(f"--since {since_spec}")
+    what = " + ".join(bits) if bits else "these filters"
+    tip = "try --full-list" if since_seconds(since_spec) is not None else ""
+    if query and not content:
+        tip = (tip + " · " if tip else "") + "--content searches inside the transcripts"
+    return f"nothing matches {what}" + (f" — {tip}" if tip else "")
+
+def emit_plain(agent, query, include_sub, as_json, since_spec, content=False, dirspec=""):
+    sel, _secs = _filter_rows(agent, query, include_sub, since_spec, content, dirspec)
     for r in sel:
         if as_json:
             print(json.dumps({"id": r["i"], "source": f'{r["a"]}·{r["s"]}',
+                              "agent": r["a"], "store": r["s"],
                               "updated": fmt_ts(r["t"]), "updated_ts": int(r["t"]),
-                              "title": r["n"], "project": r["j"], "last_role": r["r"],
-                              "last_message_head": clean(r["l"], 200),
-                              "last_message_tail": tail_disp(r["l"], r.get("z") or "", 200, 200),
+                              "updated_iso": iso_ts(r["t"]),
+                              "title": r["n"], "project": r["j"], "dir": r.get("d") or "",
+                              "subagent": r["s"] == "sub", "last_role": r["r"],
+                              "last_message_head": r["l"],
+                              "last_message_tail": r.get("z") or "",
                               "path": r["p"], "ref": r["f"]}, ensure_ascii=False))
         else:
             print("\t".join(esc(x) for x in (
                 r["i"], f'{r["a"]}·{r["s"]}', fmt_ts(r["t"]), clean(r["n"], 80),
-                clean(r["l"], 160), tail_disp(r["l"], r.get("z") or "", 160, 160), r["p"])))
+                clean(r["l"], 160), tail_disp(r["l"], r.get("z") or "", 160, 160),
+                r.get("d") or "", r["p"])))
 
 if CMD == "index":
-    emit_index(ARG1 or "all", ARG2, ARG3 == "1", ARG4 == "1")
+    emit_index(ARG1 or "all", ARG2, ARG3 == "1", ARG4 == "1", ARG5)
 elif CMD == "list":
-    emit_plain(ARG1 or "all", ARG2, ARG3 == "1", False, ARG4, ARG5 == "1")
+    emit_plain(ARG1 or "all", ARG2, ARG3 == "1", False, ARG4, ARG5 == "1", ARG6)
 elif CMD == "json":
-    emit_plain(ARG1 or "all", ARG2, ARG3 == "1", True, ARG4, ARG5 == "1")
+    emit_plain(ARG1 or "all", ARG2, ARG3 == "1", True, ARG4, ARG5 == "1", ARG6)
 elif CMD == "table":
-    emit_table(ARG1 or "all", ARG2, ARG3 == "1", ARG4, ARG5 == "1")
+    emit_table(ARG1 or "all", ARG2, ARG3 == "1", ARG4, ARG5 == "1", ARG6)
 elif CMD == "legend":
     print(f'{DIM}{"AGE":>4} {"SOURCE":<11} {"ID":<8} {"TITLE":<44} {"PROJECT":<16} {"FROM":>6}  LAST MESSAGE HEAD ⋯ TAIL{R}')
 elif CMD == "details":
-    do_details(ARG1, ARG2)
+    do_details(ARG1, ARG2, ARG3)
 elif CMD == "export":
-    do_export(ARG1)
+    do_export(ARG1, ARG2)
 elif CMD == "doctor":
     do_doctor(True)
 elif CMD == "path":
@@ -1339,7 +1655,7 @@ PYCODE
 }
 
 # ---------------------------------------------------------------- helpers
-ref_path() { printf '%s' "$1" | cut -d'|' -f2; }
+ref_path() { local r="${1#*|}"; printf '%s' "${r%|*}"; }   # handles '|' inside the path
 
 copy_ref_path() {
   local p; p="$(ref_path "$1")"
@@ -1389,14 +1705,19 @@ do_install() {
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$SELF"; }
 
 # ---------------------------------------------------------------- arg parsing
-AGENT="" QUERY="" SUB=0 CMD="" MODE="" SINCE="" CONTENT=0
+AGENT="" QUERY="" SUB=0 CMD="" MODE="" SINCE="" CONTENT=0 DIR="" ACTION="" ACTARG="" OUT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --agent=*) AGENT="${1#*=}" ;;
     --agent|-a) shift; AGENT="${1:-}" ;;
     --query=*) QUERY="${1#*=}" ;;
     --query|-q) shift; QUERY="${1:-}" ;;
+    --dir=*) DIR="${1#*=}" ;;
+    --dir|-d) shift; DIR="${1:-}" ;;
+    --here) DIR="$PWD" ;;
     --content|-c) CONTENT=1 ;;
+    --out=*) OUT="${1#*=}" ;;
+    --out|-o) shift; OUT="${1:-}" ;;
     --scan=*) export TRANSCRIPTS_SCAN="${1#*=}" ;;
     --scan) shift; export TRANSCRIPTS_SCAN="${1:-}" ;;
     --list|-l|--print) MODE=list ;;
@@ -1408,26 +1729,27 @@ while [ $# -gt 0 ]; do
     --full-list|--all|--full) SINCE=all ;;
     --subagents) SUB=1 ;;
     --install) do_install; exit $? ;;
-    --doctor) run_py doctor; exit $? ;;
-    --details) shift; run_py details "${1:-}" "$QUERY"; exit $? ;;
-    --export) shift; run_py export "${1:-}"; exit $? ;;
+    # actions run AFTER parsing, so `--details REF -q term` works the same as `-q term --details REF`
+    --doctor) ACTION=doctor ;;
+    --details) shift; ACTION=details; ACTARG="${1:-}" ;;
+    --export) shift; ACTION=export; ACTARG="${1:-}" ;;
     --version) echo "transcripts $VERSION"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
-    __index) run_py index "${2:-all}" "${3:-}" "${4:-0}"; exit $? ;;
+    __index) run_py index "${2:-all}" "${3:-}" "${4:-0}" "${5:-0}" "${6:-}"; exit $? ;;
     __details) # __details REF [QUERY] [STATE] — fall back to the sticky query from ctrl-f
       dq="${3:-}"
       [ -z "$dq" ] && [ -n "${4:-}" ] && dq="$(state_query "$4")"
       run_py details "${2:-}" "$dq"; exit $? ;;
-    __export) run_py export "${2:-}"; exit $? ;;
+    __export) run_py export "${2:-}" "${3:-}"; exit $? ;;
     __copy) copy_ref_path "${2:-}"; exit 0 ;;
-    __reload) # __reload STATE SUB QUERY [next|content]
-      st="${2:-}"; sb="${3:-0}"; q="${4:-}"; md="${5:-}"
+    __reload) # __reload STATE SUB QUERY [next|content] [DIR]
+      st="${2:-}"; sb="${3:-0}"; q="${4:-}"; md="${5:-}"; dr="${6:-}"
       [ "$md" = "next" ] && cycle_state "$st"
       # ctrl-f makes the query sticky (for preview highlighting); ctrl-r/ctrl-a clear it
       if [ "$md" = "content" ]; then write_state "$st" "$(state_agent "$st")" "$q"
       else write_state "$st" "$(state_agent "$st")" ""; fi
       run_py index "$(state_agent "$st")" "$q" "$sb" \
-        "$([ "$md" = "content" ] && echo 1 || echo 0)"; exit $? ;;
+        "$([ "$md" = "content" ] && echo 1 || echo 0)" "$dr"; exit $? ;;
     *) echo "transcripts: unknown option $1 (see --help)"; exit 1 ;;
   esac
   shift
@@ -1435,19 +1757,35 @@ done
 
 case "$AGENT" in ""|all|claude|cursor) ;; *) echo "transcripts: --agent must be claude|cursor|all"; exit 1 ;; esac
 
+# A missing directory is worth flagging (usually a typo) but must not be fatal: finding the
+# sessions from a project you already deleted is exactly when --dir earns its keep.
+if [ -n "$DIR" ] && [ ! -d "$DIR" ]; then
+  echo "transcripts: --dir '$DIR' does not exist — matching on the recorded path anyway" >&2
+fi
+
+case "$ACTION" in
+  doctor)  run_py doctor; exit $? ;;
+  details) run_py details "$ACTARG" "$QUERY" "$MODE"; exit $? ;;
+  export)  run_py export  "$ACTARG" "$OUT"; exit $? ;;
+esac
+
 # ---------------------------------------------------------------- non-interactive list
 [ -n "$SINCE" ] && [ -z "$MODE" ] && MODE=list   # --since/--full-list imply --list
+# No terminal on stdout means nobody can drive a TUI: `transcripts -q x | head` used to launch
+# fzf, fail invisibly and print nothing at all. Piped always means list.
+[ -z "$MODE" ] && [ ! -t 1 ] && MODE=list
 if [ -n "$MODE" ]; then
   FMT="$MODE"
   if [ "$MODE" = list ]; then                     # auto: pretty table on tty, TSV when piped
     if [ -t 1 ]; then FMT=table; else FMT=list; fi
   elif [ "$MODE" = tsv ]; then FMT=list
   fi
-  # searching a 24h window is a surprise, not a default: a query means "look everywhere"
+  # searching a 24h window is a surprise, not a default: any explicit filter (a query or a
+  # directory scope) means "look everywhere". Only an unfiltered list defaults to recent.
   if [ -z "$SINCE" ]; then
-    if [ -n "$QUERY" ]; then SINCE=all; else SINCE=24h; fi
+    if [ -n "$QUERY" ] || [ -n "$DIR" ]; then SINCE=all; else SINCE=24h; fi
   fi
-  run_py "$FMT" "${AGENT:-all}" "$QUERY" "$SUB" "$SINCE" "$CONTENT"
+  run_py "$FMT" "${AGENT:-all}" "$QUERY" "$SUB" "$SINCE" "$CONTENT" "$DIR"
   exit $?
 fi
 
@@ -1478,20 +1816,31 @@ trap 'rm -f "$STATE"' EXIT
 if command -v fzf >/dev/null 2>&1 && [ -z "${TRANSCRIPTS_NO_FZF:-}" ]; then
   SELQ="'$SELF'"
   LEGEND="  $(run_py legend)"
+  # ctrl-a cycles the agent, so a fixed prompt string goes stale ("cursor ›" over claude rows).
+  # transform-prompt (fzf >= 0.45) re-reads the agent from the state file; older fzf keeps the
+  # static prompt rather than dying on an unknown action.
+  FZFV="$(fzf --version 2>/dev/null | sed 's/[^0-9.].*//')"
+  if [ "$(printf '0.45\n%s\n' "${FZFV:-0}" | sort -V | head -1)" = "0.45" ] && [ -n "$FZFV" ]; then
+    PROMPT_BACK="+transform-prompt(printf '  %s › type to filter: ' \"\$(sed -n 1p '$STATE')\")"
+    PROMPT_DEEP="+transform-prompt(printf '  %s › matched inside transcripts, refine: ' \"\$(sed -n 1p '$STATE')\")+clear-query"
+  else
+    PROMPT_BACK="+change-prompt(  › type to filter: )"
+    PROMPT_DEEP="+change-prompt(  › matched inside transcripts, refine: )+clear-query"
+  fi
   HDR="$LEGEND
  ⏎ pick (copies path) · ⇥ show/hide transcript · ^F search inside transcripts · ^A switch agent
  ^E export .md · ^Y copy path · ^R refresh (back to fast filter) · esc quit"
-  sel="$(run_py index "$AGENT" "$QUERY" "$SUB" "$CONTENT" | fzf \
+  sel="$(run_py index "$AGENT" "$QUERY" "$SUB" "$CONTENT" "$DIR" | fzf \
     --ansi --delimiter='\t' --with-nth=2.. --no-hscroll --tiebreak=index \
     --exact --info=inline \
-    --prompt="  $AGENT ${QUERY:+[$QUERY] }› type to filter: " \
+    --prompt="  $AGENT ${DIR:+(dir) }${QUERY:+[$QUERY] }› type to filter: " \
     --header="$HDR" \
     --preview="$SELQ __details {1} {q} '$STATE'" \
     --preview-window='down:60%:wrap' \
     --bind='tab:toggle-preview' \
-    --bind="ctrl-f:reload($SELQ __reload '$STATE' $SUB {q} content)+change-prompt(  $AGENT › matched inside transcripts, refine: )+clear-query" \
-    --bind="ctrl-a:reload($SELQ __reload '$STATE' $SUB '' next)+change-prompt(  $AGENT › type to filter: )+clear-query" \
-    --bind="ctrl-r:reload($SELQ __reload '$STATE' $SUB '')+change-prompt(  $AGENT › type to filter: )" \
+    --bind="ctrl-f:reload($SELQ __reload '$STATE' $SUB {q} content '$DIR')$PROMPT_DEEP" \
+    --bind="ctrl-a:reload($SELQ __reload '$STATE' $SUB '' next '$DIR')$PROMPT_BACK+clear-query" \
+    --bind="ctrl-r:reload($SELQ __reload '$STATE' $SUB '' '' '$DIR')$PROMPT_BACK" \
     --bind="ctrl-y:execute-silent($SELQ __copy {1})" \
     --bind="ctrl-e:execute-silent($SELQ __export {1})" \
   )"
@@ -1528,11 +1877,13 @@ fi
 echo "tip: 'brew install fzf' unlocks the nicer TUI (live fuzzy filter + preview pane)." >&2
 OFF=0; PAGE=25
 while :; do
-  LIST="$(run_py index "$(state_agent "$STATE")" "$QUERY" "$SUB" "$CONTENT")"
+  LIST="$(run_py index "$(state_agent "$STATE")" "$QUERY" "$SUB" "$CONTENT" "$DIR")"
   TOTAL=$(printf '%s' "$LIST" | grep -c . || true)
   echo
-  printf '\033[1m── transcripts · agent: %s%s · %s found ──\033[0m\n' \
-    "$(state_agent "$STATE")" "$([ -n "$QUERY" ] && printf ' · filter: "%s"' "$QUERY")" "$TOTAL"
+  printf '\033[1m── transcripts · agent: %s%s%s%s · %s found ──\033[0m\n' \
+    "$(state_agent "$STATE")" "$([ -n "$QUERY" ] && printf ' · filter: "%s"' "$QUERY")" \
+    "$([ -n "$DIR" ] && printf ' · dir: %s' "$DIR")" \
+    "$([ "$CONTENT" = 1 ] && printf ' · content')" "$TOTAL"
   printf '  #  %s\n' "$(run_py legend)"
   if [ "$TOTAL" -eq 0 ]; then
     echo "  (nothing matches — try 'a' to switch agent or '/' to change the filter)"
