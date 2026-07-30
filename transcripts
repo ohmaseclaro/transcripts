@@ -20,6 +20,9 @@
 #                                      #   · shows last 24h unless a filter says otherwise
 #   transcripts --json                 # same rows, one JSON object per line
 #   transcripts --table | --tsv        # force the pretty table / force raw TSV
+#                                      #   (the table drops to a per-session card layout on
+#                                      #    terminals under 88 columns; the transcript path is
+#                                      #    always shown in full, wrapping if it must)
 #   transcripts --list --since 10d     # look-back window: Nm / Nh / Nd / Nw · short: -s
 #   transcripts --list --full-list     # no time window: list everything
 #   transcripts --subagents            # include cursor subagent/background transcripts (no short)
@@ -76,7 +79,7 @@
 #                  ctrl-a=switch agent · ctrl-e=export markdown · ctrl-y=copy path · ctrl-r=refresh
 set -u
 
-VERSION="1.11.0"
+VERSION="1.12.0"
 SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || echo "$0")"
 
 command -v python3 >/dev/null 2>&1 || { echo "transcripts: python3 required (macOS: xcode-select --install)"; exit 1; }
@@ -1544,6 +1547,52 @@ def clip_w_end(s, n):
         out.append(ch); w += cw
     return "".join(reversed(out))
 
+def wrap_w(s, n):
+    """Wrap to n display columns. Long unbroken tokens (paths!) are hard-split rather than
+    allowed to overflow, so nothing ever needs truncating to fit."""
+    if n < 4: return [s]
+    out, line = [], ""
+    for word in s.split(" "):
+        while dwidth(word) > n:
+            take = ""
+            for ch in word:
+                if dwidth(take + ch) > n: break
+                take += ch
+            if not take: break
+            if line: out.append(line); line = ""
+            out.append(take); word = word[len(take):]
+        if not word: continue
+        if not line: line = word
+        elif dwidth(line) + 1 + dwidth(word) <= n: line += " " + word
+        else: out.append(line); line = word
+    if line: out.append(line)
+    return out or [""]
+
+def disp_path(p):
+    """Home-relative so it stays short and still pastes into a shell."""
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if p.startswith(home) else p
+
+def emit_cards(sel, width, headline, nomatch):
+    """Narrow terminals: the boxed table squeezes every column into uselessness and clips the
+    path, which is the one thing you actually need. One block per session instead."""
+    print(headline)
+    if not sel:
+        print(nomatch); return
+    for r in sel:
+        tag = f'{r["a"]}·{r["s"]}'
+        meta = f'{tag} · {time.strftime("%d %b %H:%M", time.localtime(r["t"]))} · {r["i"][:8]}'
+        if r["j"]: meta += f' · {r["j"]}'
+        pfx = ("you" if r["r"] == "user" else r["r"]) + ": " if r["r"] else ""
+        for i, l in enumerate(wrap_w(clean(r["n"]) or "(untitled)", width - 2)):
+            print(f'{BOLD}{"● " if i == 0 else "  "}{l}{R}')
+        print(f"{DIM}  {clip_w(meta, width - 2)}{R}")
+        for l in wrap_w(clean(pfx + r["l"]), width - 4)[:2]:
+            print(f"  {l}")
+        for i, l in enumerate(wrap_w(disp_path(r["p"]), width - 4)):
+            print(f'{DIM}  {"⤷" if i == 0 else " "} {R}{l}')
+        print()
+
 def emit_table(agent, query, include_sub, since_spec, content=False, dirspec=""):
     sel, secs = _filter_rows(agent, query, include_sub, since_spec, content, dirspec)
     try: width = os.get_terminal_size(sys.__stdout__.fileno()).columns
@@ -1553,9 +1602,18 @@ def emit_table(agent, query, include_sub, since_spec, content=False, dirspec="")
     IDW, SRW, UPW = 8, 11, 12
     # Narrow terminals used to get a 110-column table that wrapped into unreadable garbage.
     # Drop the tail column first, then the id, rather than overflowing.
+    w_desc0 = "all time" if secs is None else f"last {(since_spec or '').strip().lower()}"
+    scope0 = f" · dir: {norm_dir(dirspec)}" if dirspec else ""
+    headline = DIM + "\n".join(wrap_w(
+        f"transcripts · agent={agent} · {w_desc0} · {len(sel)} shown"
+        f"{(' · filter: ' + query) if query else ''}{scope0}"
+        f"{' · content' if content else ''}", max(20, width))) + R
+    if width < 88:
+        return emit_cards(sel, width, headline,
+                          no_match_hint(query, since_spec, content, dirspec))
     cols = ["ID", "SOURCE", "UPDATED", "TITLE", "LAST MESSAGE HEAD", "LAST MESSAGE TAIL"]
-    show_tail = width >= 100
-    show_id = width >= 76
+    show_tail = width >= 118
+    show_id = width >= 100
     if not show_tail: cols.remove("LAST MESSAGE TAIL")
     if not show_id: cols.remove("ID")
     nsep = 3 * len(cols) + 1
@@ -1567,18 +1625,13 @@ def emit_table(agent, query, include_sub, since_spec, content=False, dirspec="")
         TW = max(16, int(flex * 0.42)); HW = max(14, flex - TW); ZW = 0
     widths = ([IDW] if show_id else []) + [SRW, UPW, TW, HW] + ([ZW] if show_tail else [])
     W = sum(widths) + nsep
-    w_desc = "all time" if secs is None else f"last {(since_spec or '').strip().lower()}"
     def hline(lft, mid, rgt):
         return DIM + lft + mid.join("─" * (w + 2) for w in widths) + rgt + R
     sep = DIM + "│" + R
-    scope = f" · dir: {norm_dir(dirspec)}" if dirspec else ""
-    out = [f"{DIM}transcripts · agent={agent} · {w_desc} · {len(sel)} shown"
-           f"{(' · filter: ' + query) if query else ''}{scope}"
-           f"{' · content' if content else ''} · full paths: --tsv or pipe{R}",
+    out = [headline,
            hline("┌", "┬", "┐"),
            sep + sep.join(f" {BOLD}{_pad(h, w)}{R} " for h, w in zip(cols, widths)) + sep,
            hline("├", "┼", "┤")]
-    home = os.path.expanduser("~")
     for r in sel:
         tag = f'{r["a"]}·{r["s"]}'
         pfx = ("you" if r["r"] == "user" else r["r"]) + ": " if r["r"] else ""
@@ -1590,11 +1643,12 @@ def emit_table(agent, query, include_sub, since_spec, content=False, dirspec="")
         if show_tail:
             cells.append(_pad_end(tail_disp(r["l"], r.get("z") or "", max(1, HW - len(pfx)), ZW), ZW))
         out.append(sep + sep.join(f" {c} " for c in cells) + sep)
-        p = r["p"]
-        if p.startswith(home): p = "~" + p[len(home):]
+        # The path is the payload — never clip it. It wraps across as many boxed lines as it
+        # needs, so a deep project slug stays copy-pasteable on any terminal width.
         pw = W - 6
-        if dwidth(p) > pw: p = "…" + clip_w_end(p, pw - 1)
-        out.append(DIM + "│ ⤷ " + p + " " * max(0, pw - dwidth(p)) + " │" + R)
+        for i, line in enumerate(wrap_w(disp_path(r["p"]), pw)):
+            mark = "⤷" if i == 0 else " "
+            out.append(f'{DIM}│ {mark} {R}{line}{" " * max(0, pw - dwidth(line))}{DIM} │{R}')
     out.append(hline("└", "┴", "┘"))
     if not sel:
         out.append(no_match_hint(query, since_spec, content, dirspec))

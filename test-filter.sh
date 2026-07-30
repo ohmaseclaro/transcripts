@@ -254,5 +254,47 @@ ws = {w(l.rstrip("\n")) for l in sys.stdin}
 print(len(ws))')"
 ok "table rows all render at one width (emoji/CJK safe)" 1 "$ROWS"
 
+# 17. the transcript path is the payload: never truncated, at any width
+LONGPROJ="$HOME_DIR/.claude/projects/-Users-nobody-a-very-deeply-nested-project-path-that-will-not-fit"
+mkdir -p "$LONGPROJ"
+LP="$LONGPROJ/eeeeeeee-9999-9999-9999-999999999999.jsonl"
+msg "$LP" user "long path session" "2026-07-27T10:00:00Z"
+for w in 60 80 100 140; do
+  OUT="$(TRANSCRIPTS_HOME="$HOME_DIR" COLUMNS=$w "$TR" --table -s 7d 2>/dev/null)"
+  # the full path must be reconstructable from the rendered output (allowing for wrapping)
+  FLAT="$(printf '%s' "$OUT" | sed 's/[│⤷]//g' | tr -d ' \n')"
+  case "$FLAT" in
+    *"eeeeeeee-9999-9999-9999-999999999999.jsonl"*)
+      PASS=$((PASS + 1)); echo "  ok   full path survives at COLUMNS=$w" ;;
+    *) FAIL=$((FAIL + 1)); echo "  FAIL path truncated at COLUMNS=$w" ;;
+  esac
+  case "$FLAT" in
+    *"a-very-deeply-nested-project-path-that-will-not-fit"*) : ;;
+    *) FAIL=$((FAIL + 1)); echo "  FAIL project dir lost from path at COLUMNS=$w" ;;
+  esac
+done
+
+# every rendered line of the boxed table must be exactly one width
+for w in 100 140; do
+  N="$(TRANSCRIPTS_HOME="$HOME_DIR" COLUMNS=$w "$TR" --table -s 7d 2>/dev/null \
+       | grep '^[│┌├└]' | python3 -c '
+import sys, unicodedata
+def dw(s):
+    t = 0
+    for ch in s:
+        if unicodedata.combining(ch): continue
+        o = ord(ch)
+        t += 2 if unicodedata.east_asian_width(ch) in ("W","F") or 0x1F300 <= o <= 0x1FAFF \
+                  or 0x2600 <= o <= 0x27BF else 1
+    return t
+print(len({dw(l.rstrip(chr(10))) for l in sys.stdin}))')"
+  ok "boxed table is flush at COLUMNS=$w" 1 "$N"
+done
+
+# narrow terminals drop the box entirely rather than squeezing columns to nothing
+if TRANSCRIPTS_HOME="$HOME_DIR" COLUMNS=60 "$TR" --table -s 7d 2>/dev/null | grep -q '^┌'; then
+  FAIL=$((FAIL + 1)); echo "  FAIL still drawing a box at COLUMNS=60"
+else PASS=$((PASS + 1)); echo "  ok   narrow width switches to the card layout"; fi
+
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

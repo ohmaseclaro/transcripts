@@ -155,7 +155,18 @@ Piping implies `--list`: `transcripts -d . | head` gives you TSV, not a broken T
 
 ### Columns
 
-Table: `ID · SOURCE · UPDATED · TITLE · LAST MESSAGE HEAD · LAST MESSAGE TAIL`, with the transcript's file path on a second line under each row. Table width follows the terminal (`COLUMNS` respected).
+Table: `ID · SOURCE · UPDATED · TITLE · LAST MESSAGE HEAD · LAST MESSAGE TAIL`, with the transcript's file path under each row. Table width follows the terminal (`COLUMNS` respected), dropping the tail and id columns as it narrows.
+
+**The path is never truncated** — it wraps across as many lines as it needs, because it is the one thing you came for. Under 88 columns the box is abandoned entirely for a per-session card, which reads far better on a narrow terminal:
+
+```
+● Filter behavior review
+  claude·code · 30 Jul 17:48 · 7090a30d · transcripts
+  claude: Now the boxed table — wrap the path across as many
+  lines as it needs instead of clipping it:
+  ⤷ ~/.claude/projects/-Users-augustoclaro-ohmaseclaro-transcripts
+    /7090a30d-a9b8-484d-b74a-254ff7de0b6f.jsonl
+```
 
 TSV columns: `id, source, updated, title, last message head, last message tail, dir, path`.
 

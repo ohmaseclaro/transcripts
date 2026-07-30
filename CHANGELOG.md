@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.12.0
+
+**The transcript path is never truncated again.**
+
+- The path under each table row used to be clipped to fit inside the box (`⤷ …laro-transcripts/
+  7090a30d-….jsonl`), which is backwards — it is the most useful thing in the row. It now wraps
+  across as many lines as it needs, at any width, with the box staying flush.
+- Terminals under 88 columns get a **card layout** instead of a boxed table. At 66 columns the
+  old table squeezed every column into ellipses; the card gives each session a title line, a
+  metadata line, the last message, and the complete path.
+- The header line wraps instead of overflowing, and the stale "full paths: --tsv or pipe" hint
+  is gone — the paths are already full.
+- The boxed table now keeps the id column down to 100 columns and the tail column down to 118,
+  rather than cramming six columns into a width that can't hold them.
+
 ## 1.11.0
 
 **A directory filter, and a review pass over everything else.**
