@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.14.0
+
+**Typing in the TUI now finds text that only exists inside a conversation.**
+
+1.13.0 auto-escalated to a content search on the command line, but the interactive filter still
+matched cached metadata only — type a string that appears solely in a thread and the list went
+empty. Now:
+
+- fzf's `zero` event fires the content search automatically when your typing runs out of
+  metadata matches, debounced so it only runs once you pause rather than on every keystroke.
+- Rows matched on their body carry the query terms in the hidden haystack, so fzf's own filter
+  keeps showing them — without that they'd be found and then immediately hidden again.
+- Those rows are flagged with `⌕` so it's clear the match came from the conversation.
+- An empty result now emits one placeholder row instead of nothing, which also stops `zero`
+  from re-firing the deep search in a loop. It carries no ref, and picking it exits cleanly.
+- `ctrl-f` still forces the deep search when metadata already matched, and no longer clears
+  your query.
+
 ## 1.13.0
 
 **A query that matches nothing now searches the conversations by itself.**

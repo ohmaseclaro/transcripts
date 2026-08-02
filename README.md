@@ -70,10 +70,10 @@ With fzf installed:
 
 | Key      | Action |
 |----------|--------|
-| type     | filter — every word must match, over title, project, id and the last message |
+| type     | filter — every word must match. When the metadata runs out of matches, it searches the conversations themselves (pause a moment); those rows are flagged `⌕` |
 | `enter`  | pick — prints the transcript path and copies it to the clipboard |
 | `tab`    | show/hide the transcript preview pane — matches are highlighted and shown first |
-| `ctrl-f` | search *inside* the transcripts for what you typed (see [Filtering](#filtering)) |
+| `ctrl-f` | force the inside-the-transcripts search even when metadata already matched |
 | `ctrl-a` | cycle agent: all → claude → cursor |
 | `ctrl-e` | export the highlighted transcript to `~/Downloads/*.md` |
 | `ctrl-y` | copy path without leaving the list |
@@ -123,6 +123,8 @@ Narrow with --since/--agent/--dir, or raise --scan (default 300).
 Narrowing first (`-d .`, `-a claude`, `-s 7d`) is almost always faster than raising `--scan`.
 
 **You rarely need to type `--content`.** When a query matches no metadata at all, the content search runs automatically and says so on stderr — because answering "nothing found" for something sitting in the conversation is the exact failure this tool exists to avoid. Set `TRANSCRIPTS_NO_ESCALATE=1` if you want strict metadata-only behaviour.
+
+The TUI does the same thing as you type: keystrokes filter the cached metadata instantly, and the moment that yields nothing the conversations are searched (after a short pause, so it doesn't fire on every keystroke). Rows found that way are flagged `⌕`.
 
 Windows are `Nm` / `Nh` / `Nd` / `Nw` (`-s 30m`, `-s 2w`) or `all`. Anything else is rejected rather than silently ignored.
 

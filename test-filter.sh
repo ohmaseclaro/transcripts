@@ -325,5 +325,34 @@ case "$BADREF" in
   *) PASS=$((PASS + 1)); echo "  ok   malformed ref degrades gracefully" ;;
 esac
 
+# 19. a body-only match has to survive fzf's OWN live filter, or typing hides it again the
+#     instant the deep search finds it
+IDXC="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __index all "rotation" 0 1 2>/dev/null)"
+ok "deep search returns the body match to the TUI" 1 "$(count "$IDXC")"
+case "$(printf '%s' "$IDXC" | cut -f3)" in
+  *rotation*) PASS=$((PASS + 1)); echo "  ok   body match carries the term in its haystack" ;;
+  *) FAIL=$((FAIL + 1)); echo "  FAIL body match would be filtered straight back out" ;;
+esac
+if command -v fzf >/dev/null 2>&1; then
+  # shellcheck disable=SC2086
+  N="$(printf '%s\n' "$IDXC" | fzf $FZF_OPTS -f rotation | wc -l | tr -d ' ')"
+  ok "fzf keeps the body match while the query is typed" 1 "$N"
+fi
+case "$(printf '%s' "$IDXC" | cut -f2)" in
+  *⌕*) PASS=$((PASS + 1)); echo "  ok   body match is flagged in the list" ;;
+  *) FAIL=$((FAIL + 1)); echo "  FAIL no visual marker for a body match" ;;
+esac
+
+# 20. an empty result must still hand fzf a row, or its `zero` event re-triggers the deep
+#     search forever
+IDXZ="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __index all "zzqqnothingatall" 0 1 2>/dev/null)"
+ok "empty result still emits one placeholder row" 1 "$(count "$IDXZ")"
+ok "placeholder has no ref (not selectable as a session)" "" "$(printf '%s' "$IDXZ" | cut -f1)"
+if command -v fzf >/dev/null 2>&1; then
+  # shellcheck disable=SC2086
+  N="$(printf '%s\n' "$IDXZ" | fzf $FZF_OPTS -f zzqqnothingatall | wc -l | tr -d ' ')"
+  ok "placeholder survives fzf's filter (no zero-event loop)" 1 "$N"
+fi
+
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -78,11 +78,13 @@
 #   Colour is emitted only to a terminal. NO_COLOR disables it, FORCE_COLOR forces it on.
 #
 # Keys (fzf mode): type=filter · enter=pick (copies path) · tab=show/hide transcript pane
-#                  ctrl-f=search inside transcripts (--content on what you typed)
+#                  typing that runs out of metadata matches searches the conversations by
+#                  itself (pause briefly); rows matched that way are flagged with ⌕
+#                  ctrl-f=force that search even when the metadata already matched
 #                  ctrl-a=switch agent · ctrl-e=export markdown · ctrl-y=copy path · ctrl-r=refresh
 set -u
 
-VERSION="1.13.0"
+VERSION="1.14.0"
 SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || echo "$0")"
 
 command -v python3 >/dev/null 2>&1 || { echo "transcripts: python3 required (macOS: xcode-select --install)"; exit 1; }
@@ -1176,6 +1178,7 @@ def scan_cursor_app(rows, errors, include_sub):
 TAGC = {"claude·code": YL, "claude·cwrk": YL, "cursor·app": CY, "cursor·cli": CY, "cursor·sub": DIM}
 
 DEDUPED = 0
+BODY_HITS = set()      # refs whose match came from the conversation, not the cached metadata
 
 def collect(agent, include_sub):
     global DEDUPED
@@ -1197,6 +1200,7 @@ def collect(agent, include_sub):
 
 def emit_index(agent, query, include_sub, content=False, dirspec=""):
     sel, _ = _filter_rows(agent, query, include_sub, "all", content, dirspec)
+    terms = qterms(query)
     out = []
     for r in sel:
         z = r.get("z") or ""
@@ -1204,11 +1208,13 @@ def emit_index(agent, query, include_sub, content=False, dirspec=""):
         col = TAGC.get(tag, "")
         rolec = CY if r["r"] == "user" else MG
         who = "you" if r["r"] == "user" else (r["r"] or "-")
+        body = r["f"] in BODY_HITS
+        mark = f"{YL}⌕{R} " if body else ""
         lm = clean(r["l"], 110)
         zt = tail_disp(r["l"], z, 110, 110)
-        vis = dwidth(lm) + (3 + dwidth(zt) if zt else 0)
+        vis = dwidth(lm) + (3 + dwidth(zt) if zt else 0) + (2 if body else 0)
         if zt: lm += f' {DIM}⋯{R} {zt}'
-        lm += " " * max(0, 110 - vis)      # fixed width: keeps field 3 past the right edge
+        lm = mark + lm + " " * max(0, 110 - vis)   # fixed width: keeps field 3 past the right edge
         disp = (f'{DIM}{rpad_w(rel(r["t"]), 4)}{R} {col}{pad_w(tag, 11)}{R} '
                 f'{DIM}{pad_w(r["i"][:8], 8)}{R} '
                 f'{BOLD}{pad_w(clean(r["n"]), 44)}{R} {GR}{pad_w(clean(r["j"]), 16)}{R} '
@@ -1217,7 +1223,18 @@ def emit_index(agent, query, include_sub, content=False, dirspec=""):
         # --no-hscroll, and the padding above puts field 3 ~205 columns in — so typing in the TUI
         # searches everything the cache knows while only the columns stay on screen.
         # (--nth can't do this: fzf applies --nth AFTER --with-nth, so a hidden field is unmatchable.)
-        out.append(esc(r["f"]) + "\t" + esc(disp) + "\t" + esc(row_hay(r)))
+        # A row matched on its body has none of the query text in its metadata, so fzf's own
+        # live filter would immediately hide it again. Adding the terms to the hidden haystack
+        # keeps it visible and lets typing keep narrowing normally.
+        hay = row_hay(r) + (" " + " ".join(terms) if body else "")
+        out.append(esc(r["f"]) + "\t" + esc(disp) + "\t" + esc(hay))
+    if not out and terms:
+        # Never hand fzf an empty list while a query is active: its `zero` event would fire the
+        # deep search again, which returns nothing, which fires `zero`… One placeholder row,
+        # carrying the terms so fzf keeps showing it, breaks the loop and explains the state.
+        out.append("\t" + f'{DIM}   no session matches {R}{BOLD}{query}{R}'
+                          f'{DIM} — ^R to clear the filter, ^A to switch agent{R}'
+                   + "\t" + esc(" ".join(terms)))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 # ------------------------------------------------------------- details / export
@@ -1548,6 +1565,7 @@ def _filter_rows(agent, query, include_sub, since_spec, content=False, dirspec="
             continue
         scanned += 1
         if body_matches(r, terms):
+            BODY_HITS.add(r["f"])
             sel.append(r)
     # A query that matches nothing in the metadata is exactly the case --content exists for, and
     # the remaining filters usually make it cheap. Escalate rather than reporting a false "no
@@ -1910,12 +1928,17 @@ if command -v fzf >/dev/null 2>&1 && [ -z "${TRANSCRIPTS_NO_FZF:-}" ]; then
   # transform-prompt (fzf >= 0.45) re-reads the agent from the state file; older fzf keeps the
   # static prompt rather than dying on an unknown action.
   FZFV="$(fzf --version 2>/dev/null | sed 's/[^0-9.].*//')"
+  ZERO_BIND=""
   if [ "$(printf '0.45\n%s\n' "${FZFV:-0}" | sort -V | head -1)" = "0.45" ] && [ -n "$FZFV" ]; then
     PROMPT_BACK="+transform-prompt(printf '  %s › type to filter: ' \"\$(sed -n 1p '$STATE')\")"
-    PROMPT_DEEP="+transform-prompt(printf '  %s › matched inside transcripts, refine: ' \"\$(sed -n 1p '$STATE')\")+clear-query"
+    PROMPT_DEEP="+transform-prompt(printf '  %s › searched inside transcripts: ' \"\$(sed -n 1p '$STATE')\")"
+    # Typing that runs out of metadata matches searches the conversations by itself. The sleep
+    # is a debounce: fzf kills the pending reload on the next keystroke, so the expensive scan
+    # only runs once you stop typing.
+    ZERO_BIND="--bind=zero:reload(sleep 0.4; $SELQ __reload '$STATE' $SUB {q} content '$DIR')$PROMPT_DEEP"
   else
     PROMPT_BACK="+change-prompt(  › type to filter: )"
-    PROMPT_DEEP="+change-prompt(  › matched inside transcripts, refine: )+clear-query"
+    PROMPT_DEEP="+change-prompt(  › searched inside transcripts: )"
   fi
   HDR="$LEGEND
  ⏎ pick (copies path) · ⇥ show/hide transcript · ^F search inside transcripts · ^A switch agent
@@ -1928,6 +1951,7 @@ if command -v fzf >/dev/null 2>&1 && [ -z "${TRANSCRIPTS_NO_FZF:-}" ]; then
     --preview="$SELQ __details {1} {q} '$STATE'" \
     --preview-window='down:60%:wrap' \
     --bind='tab:toggle-preview' \
+    ${ZERO_BIND:+"$ZERO_BIND"} \
     --bind="ctrl-f:reload($SELQ __reload '$STATE' $SUB {q} content '$DIR')$PROMPT_DEEP" \
     --bind="ctrl-a:reload($SELQ __reload '$STATE' $SUB '' next '$DIR')$PROMPT_BACK+clear-query" \
     --bind="ctrl-r:reload($SELQ __reload '$STATE' $SUB '' '' '$DIR')$PROMPT_BACK" \
@@ -1937,6 +1961,10 @@ if command -v fzf >/dev/null 2>&1 && [ -z "${TRANSCRIPTS_NO_FZF:-}" ]; then
   rc=$?
   if [ $rc -eq 0 ] && [ -n "$sel" ]; then
     ref="${sel%%$'\t'*}"
+    case "$ref" in
+      *"|"*) ;;
+      *) echo "transcripts: nothing selected (no session matched the filter)" >&2; exit 1 ;;
+    esac
     p="$(ref_path "$ref")"
     if [ -t 1 ]; then
       if copy_ref_path "$ref"; then
