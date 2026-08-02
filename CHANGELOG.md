@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.13.0
+
+**A query that matches nothing now searches the conversations by itself.**
+
+- `transcripts -q "20260802110000-seed" -d .` used to come back empty whenever the string only
+  appeared *inside* a conversation — the exact false negative `--content` exists to prevent, but
+  you had to already know to ask for it. When a query matches no metadata at all, the content
+  search now runs automatically and says so on stderr. `TRANSCRIPTS_NO_ESCALATE=1` restores
+  strict behaviour.
+- Content search got ~4× faster (10.2s → 2.5s on a real query): a raw byte scan now rejects
+  files without parsing a line of JSON, and only survivors are parsed to confirm the hit is in a
+  real message rather than a tool result.
+- **The fzf preview crashed on an empty list** with `could not parse ref: not enough values to
+  unpack (expected 3, got 1)`, because fzf renders the preview even with nothing selected. That
+  pane now explains why the list is empty and which key to press.
+
 ## 1.12.0
 
 **The transcript path is never truncated again.**

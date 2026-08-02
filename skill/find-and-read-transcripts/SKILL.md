@@ -68,6 +68,11 @@ before concluding nothing exists.
   transcripts (default 300, newest first), printing what it skipped on stderr. **Narrow before
   you deepen**: `-a claude -s 7d --content` beats `--content --scan 2000`.
 
+If a query matches no metadata at all, the content search runs automatically (a note goes to
+stderr), so a plain `-q` will not report a false "nothing found" for something said inside a
+conversation. Pass `--content` explicitly when you want it searched even though the metadata
+already matched something.
+
 A query searches all time by default. Without a query the window is 24h, so pass `--since`
 when listing. Add `--subagents` if the user means a background/subagent run.
 

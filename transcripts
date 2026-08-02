@@ -52,6 +52,9 @@
 #   --content/-c    ALSO read each non-matching transcript and search its messages. Slow. Stops
 #                   after --scan transcripts (default 300, newest first) and says so on stderr.
 #                   Narrowing with -d/-a/-s first beats raising --scan.
+#                   You rarely need to pass it: when a query matches NO metadata at all, the
+#                   content search runs automatically (it says so on stderr). Set
+#                   TRANSCRIPTS_NO_ESCALATE=1 for strict metadata-only behaviour.
 #
 #     transcripts -q "oauth bug"                 # metadata only (fast)
 #     transcripts -d . -q oauth -c               # this tree, searching inside the transcripts
@@ -79,7 +82,7 @@
 #                  ctrl-a=switch agent · ctrl-e=export markdown · ctrl-y=copy path · ctrl-r=refresh
 set -u
 
-VERSION="1.12.0"
+VERSION="1.13.0"
 SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || echo "$0")"
 
 command -v python3 >/dev/null 2>&1 || { echo "transcripts: python3 required (macOS: xcode-select --install)"; exit 1; }
@@ -255,19 +258,29 @@ def snip(t, terms, n=700):
     s = max(0, at - 120)
     return "… " + t[s:s + n] + (" …" if s + n < len(t) else "")
 
-def body_text(r):
-    """Full conversation text for a row. Only called under --content: this opens the
-    transcript (jsonl read / sqlite query), so it is orders of magnitude slower than row_hay.
-    Reads the WHOLE session — a search that quietly skipped the first half of a long
-    conversation would be worse than no search at all."""
+def body_matches(r, terms):
+    """Does the conversation itself contain every term? Only called under --content: this opens
+    the transcript, so it is orders of magnitude slower than row_hay. Reads the WHOLE session —
+    a search that quietly skipped the first half of a long conversation would be worse than no
+    search at all.
+
+    Two-stage on purpose: a raw byte scan rejects the great majority of files without parsing a
+    single line of JSON, and only the survivors get parsed to confirm the term is in an actual
+    message rather than in a tool result or system blob."""
     try:
         typ = r["f"].split("|", 1)[0]
         if typ == "cc":
-            return " ".join(m[1] for m in cc_messages(r["p"], 10 ** 9, whole=True))
+            with open(r["p"], "rb") as fh:
+                data = fh.read(BODY_MAX).lower()
+            # JSON escapes non-ASCII (\uXXXX), so the raw scan is only sound for plain terms
+            if all(t.isascii() for t in terms) and \
+               not all(t.encode() in data for t in terms):
+                return False
+            return qmatch(terms, " ".join(m[1] for m in cc_messages(r["p"], 10 ** 9, whole=True)))
         _typ, _path, _rid, msgs, title = get_messages(r["f"], 10 ** 9)
-        return (title or "") + " " + " ".join(m[1] for m in msgs)
+        return qmatch(terms, (title or "") + " " + " ".join(m[1] for m in msgs))
     except Exception:
-        return ""
+        return False
 
 def jload(b):
     try: return json.loads(b)
@@ -1368,6 +1381,22 @@ def do_details_json(ref, query=""):
 def do_details(ref, query="", mode=""):
     if mode == "json":
         return do_details_json(ref, query)
+    # fzf still renders the preview when the list is empty, handing us an empty {1}. That used
+    # to surface as "could not parse ref: not enough values to unpack" — turn the one pane the
+    # user is looking at into the explanation instead.
+    if "|" not in (ref or ""):
+        if ref.strip():
+            print(f"{DIM}could not read that row (ref: {ref!r}){R}")
+        else:
+            print(f"{BOLD}nothing matches this filter{R}")
+            if query: print(f"{DIM}no session's title, project or newest message "
+                            f"contains {HL}{query}{R}{DIM}.{R}")
+            print()
+            print(f"{DIM}The default filter only sees cached metadata. Press "
+                  f"{R}{BOLD}ctrl-f{R}{DIM} to search inside{R}")
+            print(f"{DIM}the transcripts themselves, {R}{BOLD}ctrl-a{R}{DIM} to switch agent, "
+                  f"or {R}{BOLD}ctrl-r{R}{DIM} to clear the filter.{R}")
+        return
     terms = qterms(query)
     # With a query, look deeper than the last 14 messages — a --content hit is usually
     # mid-conversation, and a preview that can't show why it matched is useless.
@@ -1518,8 +1547,15 @@ def _filter_rows(agent, query, include_sub, since_spec, content=False, dirspec="
             skipped += 1     # never silently truncate — reported below
             continue
         scanned += 1
-        if qmatch(terms, body_text(r)):
+        if body_matches(r, terms):
             sel.append(r)
+    # A query that matches nothing in the metadata is exactly the case --content exists for, and
+    # the remaining filters usually make it cheap. Escalate rather than reporting a false "no
+    # results" for something that is sitting in the conversation.
+    if terms and not sel and not content and not os.environ.get("TRANSCRIPTS_NO_ESCALATE"):
+        warn("transcripts: no metadata match — searching inside the transcripts "
+             "(set TRANSCRIPTS_NO_ESCALATE=1 to skip this)\n")
+        return _filter_rows(agent, query, include_sub, since_spec, True, dirspec)
     if skipped:
         warn(f"transcripts: --content read the {scanned} newest transcripts; {skipped} older ones "
              f"were NOT searched. Narrow with --since/--agent/--dir, or raise --scan "

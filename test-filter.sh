@@ -64,12 +64,26 @@ ok "multi-word AND rejects a missing word" 0 \
    "$(count "$(run --tsv -q "widget banana")")"
 
 # 3. metadata search cannot see mid-conversation text; --content can
+noesc() { TRANSCRIPTS_HOME="$HOME_DIR" TRANSCRIPTS_NO_ESCALATE=1 "$TR" "$@" 2>/dev/null; }
 ok "buried needle invisible to metadata search" 0 \
-   "$(count "$(run --tsv -q "rotation")")"
+   "$(count "$(noesc --tsv -q "rotation")")"
 ok "buried needle found with --content" 1 \
    "$(count "$(run --tsv -q "rotation" --content)")"
 ok "--content still AND-matches" 0 \
    "$(count "$(run --tsv -q "rotation banana" --content)")"
+
+# a query that matches no metadata escalates to a content search by itself: reporting "nothing
+# found" for something sitting in the conversation is the whole complaint this tool exists for
+ok "a metadata miss escalates to content search" 1 \
+   "$(count "$(run --tsv -q "rotation")")"
+ESC="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" --tsv -q rotation 2>&1 >/dev/null)"
+case "$ESC" in
+  *"searching inside the transcripts"*) PASS=$((PASS + 1)); echo "  ok   escalation is announced on stderr" ;;
+  *) FAIL=$((FAIL + 1)); echo "  FAIL escalation happened silently" ;;
+esac
+ok "TRANSCRIPTS_NO_ESCALATE keeps it strict" 0 "$(count "$(noesc --tsv -q "rotation")")"
+ok "escalation does not fire when metadata already matched" 1 \
+   "$(count "$(run --tsv -q "widget layout")")"
 
 # 4. --scan cap is reported, never silent
 CAPPED="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" --tsv -q rotation --content --scan 1 2>&1 >/dev/null)"
@@ -295,6 +309,21 @@ done
 if TRANSCRIPTS_HOME="$HOME_DIR" COLUMNS=60 "$TR" --table -s 7d 2>/dev/null | grep -q '^┌'; then
   FAIL=$((FAIL + 1)); echo "  FAIL still drawing a box at COLUMNS=60"
 else PASS=$((PASS + 1)); echo "  ok   narrow width switches to the card layout"; fi
+
+# 18. the preview pane is rendered even with an empty selection — it must explain, not crash
+EMPTY="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __details "" "nothingmatchesthis" 2>&1)"
+case "$EMPTY" in
+  *"could not parse ref"*|*Traceback*)
+    FAIL=$((FAIL + 1)); echo "  FAIL empty preview still errors: $EMPTY" ;;
+  *"nothing matches"*ctrl-f*)
+    PASS=$((PASS + 1)); echo "  ok   empty preview explains itself and points at ctrl-f" ;;
+  *) FAIL=$((FAIL + 1)); echo "  FAIL empty preview said something unexpected: $EMPTY" ;;
+esac
+BADREF="$(TRANSCRIPTS_HOME="$HOME_DIR" "$TR" __details "garbage" 2>&1)"
+case "$BADREF" in
+  *Traceback*) FAIL=$((FAIL + 1)); echo "  FAIL malformed ref raised" ;;
+  *) PASS=$((PASS + 1)); echo "  ok   malformed ref degrades gracefully" ;;
+esac
 
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

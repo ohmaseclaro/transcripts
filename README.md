@@ -122,6 +122,8 @@ Narrow with --since/--agent/--dir, or raise --scan (default 300).
 
 Narrowing first (`-d .`, `-a claude`, `-s 7d`) is almost always faster than raising `--scan`.
 
+**You rarely need to type `--content`.** When a query matches no metadata at all, the content search runs automatically and says so on stderr — because answering "nothing found" for something sitting in the conversation is the exact failure this tool exists to avoid. Set `TRANSCRIPTS_NO_ESCALATE=1` if you want strict metadata-only behaviour.
+
 Windows are `Nm` / `Nh` / `Nd` / `Nw` (`-s 30m`, `-s 2w`) or `all`. Anything else is rejected rather than silently ignored.
 
 ### Seeing why something matched
@@ -215,6 +217,7 @@ Parsed results are cached in `~/.cache/transcripts-tui/index-v5.json`, keyed by 
 | `TRANSCRIPTS_NO_FZF`  | set to force the no-fzf fallback TUI |
 | `TRANSCRIPTS_SCAN`    | default `--content` scan cap (default 300) |
 | `TRANSCRIPTS_KV_CAP`  | max Cursor composer records read per database (default 4000) |
+| `TRANSCRIPTS_NO_ESCALATE` | never auto-run the content search on a metadata miss |
 | `NO_COLOR`            | never emit colour (`FORCE_COLOR` forces it back on) |
 | `COLUMNS`             | table width when the terminal size can't be detected |
 
